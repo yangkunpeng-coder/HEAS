@@ -5,72 +5,80 @@
 # HEAS — Hierarchical Evolutionary Agent System
 
 **让智能体进化，也让进化策略进化。**  
-*Evidence-Guided Evolution of Agent Capabilities and Evolution Strategies*
+*Genetic-algorithm-inspired, evidence-guided evolution of agent capabilities and evolution strategies.*
 
-## 框架概述
+HEAS 是一个研究**单个任务智能体如何通过遗传算法启发的机制持续进化，以及进化策略如何进一步改进**的框架。一个 Task Agent 可以执行多个任务、积累多条轨迹；系统根据这些证据进化其能力组件，而不是把整个智能体当作黑盒反复重写。
 
-**HEAS 是一个研究智能体如何利用经验持续改进自身能力，以及如何进一步改进能力进化方法的层次化智能体框架。**
+## 核心思想：把遗传算法思想用于智能体能力进化
 
-当一个智能体反复完成任务时，真正值得积累的，不只是某次任务的答案，还包括：哪些能力反复发挥作用、哪些失误具有共性、怎样的能力组合更适合任务，以及先前的改进策略为什么成功或失败。
+HEAS 借鉴遗传算法的“个体—选择—遗传操作—评价—保留”思想，但不把传统固定长度染色体和固定概率算子机械套用到 LLM 智能体。它将智能体的可遗传能力表示为可检查、可组合、可版本化的 **TaskGenome**，并将“如何进化”单独建模为 **EvolutionPolicy**。
 
-HEAS 将这些问题划分为相互衔接的三个层次：**Task Agent 从任务中形成经验，Evolution Agent 根据经验进化智能体能力，Meta-Evolution Agent 再根据进化结果优化 Evolution Agent 的策略。** 进化不止作用于智能体的能力配置，也作用于产生这些配置的决策过程。
+| 遗传算法概念 | HEAS 中的对应机制 |
+|---|---|
+| 个体 / 基因型 | **TaskGenome = (Skill, Memory, Tools)** |
+| 候选群体与血缘 | Genome 候选、父代关系、版本与进化记录 |
+| 适应度信号 | 由外部任务环境与评价器提供的客观结果 |
+| 选择 | 根据任务经验和评价证据选择父代 |
+| 重组 / 继承 | 选择性继承并组合 Skill、Memory、Tools |
+| 变异与创新 | 修改已有能力，或生成新的 Skill、Memory 条目和工具配置 |
+| 剪枝 | 移除冗余、无效或不适用的能力组件 |
+| 代际保留 | 在可比较的评价条件下决定候选是否晋级 |
+| 元层进化 | 根据进化历史改进 **EvolutionPolicy**，并独立验证新旧策略 |
 
-框架以外部评价作为改进依据：**产生新版本不等于变得更好，提出新策略也不等于证明策略有效。** HEAS 通过明确的版本、证据与比较规则，区分进化假设、实际执行结果和得到验证的改进。
+**关键区别：** HEAS 的进化对象不是一个不可解释的完整 Prompt，也不是固定的 Workflow，而是由 Skill、Memory、Tools 组成的能力基因组。遗传操作提出候选改动，任务执行和外部评价决定改动是否值得保留。
 
-## 层次化进化架构
+## 三层架构与进化闭环
 
-### Task Agent · 从任务执行中形成经验
+1. **Task Agent — 产生任务经验。** 同一 Genome 版本执行多个任务，生成 `Trace` 与 `RunReflection`，并汇总为 `TaskExperienceSummary`，提取重复失败、有效模式和能力缺口。Task Agent 可以反思，但不直接改写自己的可遗传 Genome。
+2. **Evolution Agent — 进化能力基因组。** 根据任务经验和外部评价选择父代，对 Skill、Memory、Tools 执行继承、重组、变异、创新或剪枝，生成有版本和血缘记录的子代。子代必须执行任务并接受评价。
+3. **Meta-Evolution Agent — 进化进化策略。** 分析多次 `EvolutionAttempt` 及其结果，提出新的 `EvolutionPolicy`，再通过初始条件、任务和预算相匹配的独立试验比较新旧策略。
 
-Task Agent 是独立完成任务的单智能体，其可遗传能力表示为 **TaskGenome = (Skill, Memory, Tools)**：Skill 描述可复用的方法与操作流程，Memory 承载可继承的知识与经验，Tools 定义经 Host 允许的外部操作能力。
+```text
+多任务执行
+    ↓
+Trace + RunReflection
+    ↓
+TaskExperienceSummary
+    ↓
+选择父代 → 继承 / 重组 / 变异 / 创新 / 剪枝
+    ↓
+子代 TaskGenome → 任务执行 → 外部评价 → 候选保留
+    ↓
+EvolutionExperienceSummary
+    ↓
+Meta-Evolution：提出并验证新的 EvolutionPolicy
+    └──────────────────────────────→ 后续进化周期
+```
 
-同一 Genome 版本执行多个任务，分别生成 **Trace** 与 **RunReflection**，再汇总为跨任务的 **TaskExperienceSummary**。总结不仅记录成败，还识别重复错误、能力缺口、有效组合及其证据来源。Task Agent 可以反思自己的执行，但**不能直接修改可遗传 Genome**。
+HEAS 采用**固定三级架构**，不是无限递归自我改进系统。Meta-Evolution Agent 不递归修改自身；Agent Loop、模型权重、客观评价规则和安全边界也不属于可进化对象。
 
-### Evolution Agent · 从任务经验中进化能力
+## 研究设计亮点
 
-Evolution Agent 读取多次任务的经验与评价证据，在 **EvolutionPolicy** 的指导下选择父代，对 Skill、Memory、Tools 进行继承、重组、变异、创新或剪枝，形成具有独立版本和血缘信息的子代。
+- **组合式基因组进化：** 将 Skill、Memory、Tools 作为可分别继承、重组、变异和剪枝的能力组件，保留版本差异与父代血缘。
+- **跨轨迹证据驱动：** 不根据单次成功或模型自评直接决定进化；任务层汇总多条执行轨迹，进化层再汇总多次进化尝试。
+- **从“进化个体”到“进化进化方法”：** TaskGenome 与 EvolutionPolicy 是两个不同的进化对象，分别由 Evolution Agent 和 Meta-Evolution Agent 负责。
+- **评价约束的候选选择：** 结构有效、成功执行和性能提升是不同状态；候选晋级及策略采用都需要独立、可比较的评价证据。
+- **任务无关的框架边界：** 通过 `TaskProvider`、`TaskEnvironment` 和 `TaskEvaluator` 接入任务；Benchmark 适配器与核心进化机制分离。
 
-每次能力变更都需要经过子代执行与独立评价。系统记录 **EvolutionAttempt** 和结果反馈，并将多次尝试归纳为 **EvolutionExperienceSummary**，回答的不只是“哪一个子代更好”，还有“哪些进化决策在什么条件下有效”。
+## 与代表性相关方法的比较
 
-### Meta-Evolution Agent · 从进化经验中改进进化策略
+下表概括论文公开描述中的主要研究对象与机制，用于说明 HEAS 的研究定位；它不是完整的系统综述，也不是同一实验条件下的性能排名。
 
-Meta-Evolution Agent 不直接解决底层任务，也不直接编辑 TaskGenome。它研究 Evolution Agent 的改进过程：哪些父代选择、能力组合与操作偏好产生了可靠收益，哪些策略导致退化或无效探索。
+| 方法 / 论文 | 主要改进对象与机制 | 与 HEAS 的设计侧重点区别 |
+|---|---|---|
+| [Self-Refine (2023)](https://arxiv.org/abs/2303.17651) | 通过自反馈迭代修订当前任务输出 | HEAS 关注跨任务积累的持久能力组件及其版本进化，而不只改进单次输出 |
+| [EvoAgent (NAACL 2025)](https://aclanthology.org/2025.naacl-long.315/) | 使用选择、交叉、变异等进化操作生成多智能体系统 | HEAS 聚焦单个 Task Agent 的 Skill / Memory / Tools 组合式进化，并进一步建模进化策略的改进 |
+| [AFlow (ICLR 2025)](https://proceedings.iclr.cc/paper_files/paper/2025/hash/5492ecbce4439401798dcd2c90be94cd-Abstract-Conference.html) | 通过搜索与执行反馈优化代码表示的 Agent Workflow | HEAS 不把 Workflow 作为 TaskGenome 的核心进化对象，而是进化能力组件 |
+| [Darwin Gödel Machine (2025)](https://arxiv.org/abs/2505.22954) | 修改并评价智能体代码，维护候选档案以探索开放式自改进 | HEAS 采用有明确边界的固定三级架构，不开放递归式框架自修改 |
+| [MemEvolve (ICML 2026)](https://proceedings.mlr.press/v306/zhang26fa.html) | 联合进化智能体经验知识与记忆系统架构 | HEAS 将 Memory 纳入组合式 TaskGenome，同时把 EvolutionPolicy 作为独立的第二类进化对象 |
+| [HyperAgents (2026)](https://arxiv.org/abs/2603.19461) | 允许元改进机制本身被修改，研究自指式递归改进 | HEAS 明确选择固定三级层次：改进 EvolutionPolicy，但不递归修改 Meta-Evolution Agent 自身 |
+| **HEAS（当前设计）** | **进化 TaskGenome，并基于进化经验改进 EvolutionPolicy** | **把组件级遗传操作、跨任务证据、策略元进化和独立验证纳入同一固定层次架构** |
 
-它据此提出新的 **EvolutionPolicy**，并通过匹配初始条件、任务与资源预算的独立试验比较新旧策略。策略只有通过固定验证规则后才能被采用；证据不足时保持待验证状态。
+HEAS 的研究主张不是“首次使用遗传算法”或“首次提出元进化”，而是研究如何将**可组合的能力基因组、跨多次执行的证据汇总、进化策略的改进与独立验证**整合为一个任务无关的层次化框架。上述内容属于方法设计定位；实际效果仍需通过消融实验与 Benchmark 评估验证。
 
-**HEAS 采用固定三级架构。** Meta-Evolution Agent 不递归修改自身；模型权重、Agent Loop、客观评价规则和安全边界也不属于可进化对象。
+## 安装与快速使用
 
-## 核心设计机制
-
-HEAS 的关键在于两种进化对象、两条经验链路和一套明确的验证边界。
-
-| 进化对象 | 主要内容 | 由谁改进 | 改进依据 |
-|---|---|---|---|
-| **TaskGenome** | Skill、Memory、Tools | Evolution Agent | 多任务轨迹、经验总结与候选评价 |
-| **EvolutionPolicy** | 父代选择、能力诊断、进化操作与生成指导 | Meta-Evolution Agent | 多次进化尝试、结果反思与策略对照 |
-
-**经验不是直接继承的答案，而是产生进化假设的证据。** HEAS 将运行轨迹、模型反思、客观评分与可遗传 Memory 分开存储；经验总结需要引用对应的执行和评价记录。对某种能力有效性的解释可以指导探索，但不能替代验证。
-
-**能力进化是可组合、可追溯的。** 子代通过对 Skill、Memory、Tools 的选择性继承与修改产生，保留父代、变更内容和版本关系。进化借鉴遗传算法的选择、重组与变异思想，但不依赖固定概率或固定染色体算子作为唯一改进方式。
-
-**改进需要通过独立评价。** Genome 的结构有效、任务执行完成以及性能得到提升，是三个不同的状态。候选晋级要求可比较的任务、指标和评价条件；新旧 EvolutionPolicy 需要在隔离且匹配的实验条件下进行对照。最终测试结果不应回流到进化或策略选择过程。
-
-**框架与任务解耦。** HEAS 通过 `TaskProvider`、`TaskEnvironment` 与 `TaskEvaluator` 接入外部任务系统，使用文件式版本与运行记录追溯能力和策略的演化。具体 Benchmark 由独立适配器接入，而不是写入三级 Agent 的核心逻辑。
-
-## 研究设计创新
-
-HEAS 的研究贡献体现在**将能力进化与进化策略改进纳入同一个有证据约束的层次化系统**，而非仅增加更多 Agent 角色。
-
-1. **Hierarchical Evolution — 分层且有明确分工的进化。** 将执行、能力生成和策略改进分离，使三个层次分别拥有可解释的输入、输出、进化对象和验证方式。
-2. **Compositional Genome Evolution — Skill / Memory / Tools 组合式进化。** 将能力视为可继承、可重组、可归因的资源，而不只是需要整体改写的提示词。
-3. **Evidence-Guided Evolution — 双层、跨多次尝试的证据积累。** TaskExperienceSummary 总结多个任务的能力表现；EvolutionExperienceSummary 总结多次进化的有效性与失败模式，使上层决策能够回查具体证据。
-4. **Meta-Evolution of Evolution Policies — 改进“如何改进智能体”。** 将 EvolutionPolicy 作为独立版本化对象，让进化策略本身接受经验分析、候选生成和对照验证，而不是始终由开发者固定指定。
-5. **Evaluation-Governed Evolution — 由验证结果决定进化是否成立。** 将能力提案、实际运行、客观评分和版本晋级分开管理，避免把模型自评或新版本的产生误认为性能提升。
-
-上述内容描述 HEAS 的**方法设计与研究方向**，不构成已经在所有任务上获得性能提升的实验声明。
-
-## 环境安装
-
-推荐使用 **Python 3.11**（项目要求 `>=3.11,<3.12`）。在已经激活的 Python 3.11 环境中执行：
+要求 Python `>=3.11,<3.12`。
 
 ```bash
 git clone https://github.com/yangkunpeng-coder/HEAS.git
@@ -78,56 +86,30 @@ cd HEAS
 python -m pip install -e .
 ```
 
-如果需要 Benchmark 适配器的额外 Python 依赖，可执行：
+需要 Benchmark 适配器的额外依赖时：
 
 ```bash
 python -m pip install -e ".[benchmarks]"
 ```
 
-各 Benchmark 的官方运行器、数据和容器环境需按其官方要求单独准备。HEAS 的模型调用接口兼容 OpenAI API 格式，可配置 DeepSeek 等兼容服务。
-
-复制应用配置并设置模型访问凭据（下面使用 Windows CMD）：
+Windows CMD 配置示例：
 
 ```cmd
 copy configs\application.example.json configs\application.local.json
 set "HEAS_API_KEY=YOUR_API_KEY"
-```
-
-在 `application.local.json` 中设置 `model_profile.model`、`base_url` 和 `api_key_env`。Linux/macOS 可使用 `cp` 和 `export HEAS_API_KEY=...`。不要提交包含真实密钥的本地配置；真实模型调用可能产生费用。
-
-## 快速使用
-
-**1. 查看命令。**
-
-```bash
 python -m heas --help
-python -m benchmark_adapters --help
 ```
 
-**2. 初始化 Task Agent。** 先准备两个 Markdown 文件，分别作为初始 `SKILL.md` 和 `MEMORY.md`。以下示例假定它们位于 `workspace/research/input/`：
+编辑 `configs/application.local.json` 中的模型名称、`base_url` 和 `api_key_env`。初始化一个 Task Agent：
 
-```bash
-python -m heas --workspace workspace/research init --skill workspace/research/input/SKILL.md --memory workspace/research/input/MEMORY.md
+```cmd
+python -m heas --workspace workspace\research init --skill templates\SKILL.md --memory templates\MEMORY.md
 ```
 
-记下返回的 `genome_id` 和 `policy_id`。这些命令不会直接发起付费模型调用。
-
-**3. 接入任务并运行进化实验。** HEAS 核心不内置任务答案或评测器；请通过受信任的 Host 插件注册 `TaskProvider`、`TaskEnvironment` 和需要的 `TaskEvaluator`，并在应用配置中填写 `plugin_factory`。随后准备与实际任务、Genome 和 Policy 对应的实验计划：
-
-```bash
-python -m heas --config configs/application.local.json experiment run --config configs/experiment.local.json
-```
-
-查看实验结果：
-
-```bash
-python -m heas --workspace workspace/research experiment report --id YOUR_EXPERIMENT_ID
-```
-
-实验记录包含 Genome、Trace、Reflection、Experience、EvolutionAttempt、Policy 及其评价证据。实际性能提升需要独立评分和可比较的验证任务；未提供评价器时，框架不会凭空给出改进结论。
+初始化命令会返回 `genome_id` 和 `policy_id`。运行真实任务或进化实验还需要配置可信的 Host 插件、任务环境和外部评价器；Benchmark 数据、官方运行器与容器环境需按各自项目的说明单独安装。真实模型调用可能产生费用。
 
 ## License
 
-HEAS 使用 [MIT License](LICENSE) 开源。Copyright (c) 2026 yangkunpeng-coder。
+HEAS 采用 [MIT License](LICENSE)。Copyright (c) 2026 yangkunpeng-coder。
 
-第三方 Benchmark、依赖和数据集仍分别受其自身许可证与使用条款约束。
+第三方论文、Benchmark、数据集和依赖仍受各自许可证与使用条款约束。
