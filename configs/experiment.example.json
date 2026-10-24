@@ -1,0 +1,40 @@
+{
+  "schema_version": "1.2",
+  "experiment_id": "experiment_research",
+  "output_directory": "workspace/research",
+  "initial_genome_ids": [
+    "REPLACE_GENOME_ID"
+  ],
+  "initial_policy_id": "REPLACE_POLICY_ID",
+  "training_suite": {
+    "suite_id": "research_training",
+    "version": "v1",
+    "partition": "evolution_train",
+    "groups": [
+      {
+        "provider_id": "REPLACE_PROVIDER_ID",
+        "environment_id": "REPLACE_ENVIRONMENT_ID",
+        "task_ids": [
+          "REPLACE_TASK_1",
+          "REPLACE_TASK_2",
+          "REPLACE_TASK_3"
+        ]
+      }
+    ]
+  },
+  "validation_suite": null,
+  "evaluation_suite": null,
+  "max_cycles": 2,
+  "attempts_per_cycle": 2,
+  "random_seeds": [
+    23
+  ],
+  "meta_every": 2,
+  "policy_trial": null,
+  "allow_exploratory_policy": false,
+  "total_budget": {
+    "max_model_calls": 200,
+    "max_tool_calls": 200,
+    "max_wall_seconds": 600
+  }
+}

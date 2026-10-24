@@ -1,0 +1,13 @@
+{
+  "benchmark": "evoagentbench",
+  "repository": "../../external/EvoAgentBench",
+  "private_root": "../../workspace/benchmark_private/evoagentbench",
+  "domain": "information_retrieval",
+  "official_config": "../../external/EvoAgentBench/benchmark/config.yaml",
+  "allow_execution": false,
+  "allow_paid_judges": false,
+  "offline_data": true,
+  "timeout_seconds": 600,
+  "max_evaluations": 100,
+  "partitions": {}
+}

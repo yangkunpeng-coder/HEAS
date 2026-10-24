@@ -1,0 +1,78 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "heas"
+version = "0.5.0"
+description = "Task-neutral evidence-guided hierarchical agent evolution framework"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11,<3.12"
+dependencies = ["pydantic>=2,<3", "openai>=1,<3"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.9", "mypy>=1.10"]
+benchmarks = ["PyYAML>=6,<7"]
+
+[project.scripts]
+heas = "heas.cli:main"
+heas-bench = "benchmark_adapters.cli:main"
+
+[project.urls]
+Repository = "https://github.com/yangkunpeng-coder/HEAS"
+Documentation = "https://github.com/yangkunpeng-coder/HEAS/blob/main/README.en.md"
+Issues = "https://github.com/yangkunpeng-coder/HEAS/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "."]
+addopts = "-ra"
+markers = [
+    "integration: explicitly opted-in paid external API integration",
+    "official_benchmark: explicitly opted-in real official benchmark environment",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+extend-exclude = [
+    "workspace", "build", "dist", "pytest-cache-files-*", "external",
+    "third_party", "vendor", "downloads", "datasets",
+]
+
+[tool.ruff.format]
+line-ending = "lf"
+quote-style = "double"
+indent-style = "space"
+docstring-code-format = true
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint]
+select = [
+    "E", "F", "I", "UP", "B",
+    "D100", "D101", "D102", "D103", "D200", "D205", "D400", "D401",
+    "D403", "D404", "D415", "D417",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Local tests and examples document scenarios rather than a public Python API.
+"tests/**/*.py" = ["D"]
+"examples/**/*.py" = ["D"]
+"scripts/**/*.py" = ["D"]
+
+[tool.mypy]
+python_version = "3.11"
+files = ["src/heas", "src/benchmark_adapters"]
+check_untyped_defs = true
+disallow_untyped_defs = true
+
+[[tool.mypy.overrides]]
+module = ["yaml", "mcp", "mcp.*"]
+ignore_missing_imports = true

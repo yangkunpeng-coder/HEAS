@@ -1,0 +1,14 @@
+{
+  "benchmark": "seabench",
+  "repository": "../../external/SEABench",
+  "private_root": "../../workspace/benchmark_private/seabench",
+  "sequence_file": "../../external/SEABench/tasks/controller_update/computer_use/privacy.yaml",
+  "judge_model": null,
+  "judge_base_url": "https://openrouter.ai/api/v1",
+  "judge_key_env": "OPENROUTER_API_KEY",
+  "allow_execution": false,
+  "allow_paid_judges": false,
+  "offline_data": true,
+  "timeout_seconds": 600,
+  "partitions": {}
+}

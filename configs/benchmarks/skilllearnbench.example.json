@@ -1,0 +1,27 @@
+{
+  "benchmark": "skilllearnbench",
+  "repository": "../../external/SkillLearnBench",
+  "private_root": "../../workspace/benchmark_private/skilllearnbench",
+  "task_ids": [
+    "REPLACE_PARENT/REPLACE_LEARNING_INSTANCE",
+    "REPLACE_PARENT/REPLACE_TEST_INSTANCE"
+  ],
+  "partitions": {
+    "evolution_train": [
+      "REPLACE_PARENT/REPLACE_LEARNING_INSTANCE"
+    ],
+    "final_test": [
+      "REPLACE_PARENT/REPLACE_TEST_INSTANCE"
+    ]
+  },
+  "solver_agent": "claude-code",
+  "solver_model": "claude-sonnet-4-6",
+  "judge_model": "gpt-5-mini",
+  "repeats": 1,
+  "max_steps": 100,
+  "compute_quality_metrics": false,
+  "allow_execution": false,
+  "allow_paid_judges": false,
+  "offline_data": true,
+  "timeout_seconds": 1800
+}

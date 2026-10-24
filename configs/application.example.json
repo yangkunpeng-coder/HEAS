@@ -1,0 +1,33 @@
+{
+  "workspace": "workspace/research",
+  "model_profile": {
+    "model": "SET_YOUR_API_MODEL_NAME",
+    "base_url": "https://api.deepseek.com",
+    "api_key_env": "HEAS_API_KEY",
+    "temperature": 0,
+    "tool_protocol": "native",
+    "supports_seed": false
+  },
+  "models_by_purpose": {},
+  "global_budget": {
+    "max_model_calls": 200,
+    "max_tool_calls": 200,
+    "max_wall_seconds": 600
+  },
+  "skill_selector": "rule",
+  "max_context_tokens": 32000,
+  "structured_repair_limit": 1,
+  "context_limits": {
+    "max_skills": 2,
+    "max_skill_tokens": 4096,
+    "max_memory_entries": 4,
+    "max_memory_tokens": 2048,
+    "max_tools": 8
+  },
+  "aggregation": {
+    "batch_size": 4,
+    "max_context_bytes": 32000
+  },
+  "plugin_factory": null,
+  "allowed_tool_permissions": []
+}

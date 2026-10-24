@@ -1,0 +1,19 @@
+* text=auto eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.jsonl text eol=lf
+*.toml text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.ps1 text eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.zip binary
+*.png binary
+*.pdf binary
+
+# Finalized READMEs use Markdown's intentional two-space hard line breaks.
+# Keep other whitespace checks and all LF/CRLF safety checks enabled.
+README.md whitespace=-blank-at-eol
+README.en.md whitespace=-blank-at-eol

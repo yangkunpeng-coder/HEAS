@@ -1,0 +1,22 @@
+{
+  "run_plan_id": "plan_research",
+  "genome_ids": [
+    "REPLACE_GENOME_ID"
+  ],
+  "task_provider_id": "REPLACE_PROVIDER_ID",
+  "task_ids": [
+    "REPLACE_TASK_1",
+    "REPLACE_TASK_2",
+    "REPLACE_TASK_3"
+  ],
+  "environment_adapter_id": "REPLACE_ENVIRONMENT_ID",
+  "task_evaluator_id": null,
+  "task_partition": "development",
+  "max_tasks": 3,
+  "budget": {
+    "max_model_calls": 8,
+    "max_steps": 5,
+    "max_tool_calls": 4,
+    "max_wall_seconds": 30
+  }
+}
