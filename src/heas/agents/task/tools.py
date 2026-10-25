@@ -14,7 +14,7 @@ from heas.core.ports import ToolExecutor
 from heas.infrastructure.storage import FileStore, digest
 
 
-class ToolManifest(Record):
+class ToolManifest(Record, frozen=True):
     """Record host approval, implementation identity, and allowed execution permissions."""
 
     tool_id: str
@@ -52,6 +52,10 @@ class ToolRegistry:
         """Register a new host-owned artifact or approved binding, preserving prior identities."""
         if not approval_id or not set(permissions).issubset(self.allowed_permissions):
             raise SecurityError("trusted approval and permitted capabilities required")
+        if not isinstance(arguments, type) or not issubclass(arguments, BaseModel):
+            raise SecurityError("approved tool arguments require a Pydantic model class")
+        if not isinstance(executor, ToolExecutor) or not callable(executor.execute):
+            raise SecurityError("approved tool executor requires a callable execute method")
         implementation = implementation_sha256 or getattr(executor, "expected_sha256", None)
         if not implementation:
             raise SecurityError("approved executors require a versioned implementation digest")
@@ -116,13 +120,13 @@ class ToolRegistry:
         """Reject missing or cyclic dependencies among the selected tools."""
         available = {b.tool_id: b for b in bindings}
 
-        def visit(tool_id: str, chain: set[str]) -> None:
-            if tool_id not in available or tool_id in chain:
+        def visit(current_tool_id: str, chain: set[str]) -> None:
+            if current_tool_id not in available or current_tool_id in chain:
                 raise SecurityError("missing or cyclic tool dependency")
-            binding = available[tool_id]
+            binding = available[current_tool_id]
             self.validate(binding)
-            for dep in self.entries[(tool_id, binding.version_id)][0].requires_tools:
-                visit(dep, chain | {tool_id})
+            for dep in self.entries[(current_tool_id, binding.version_id)][0].requires_tools:
+                visit(dep, chain | {current_tool_id})
 
         for tool_id in available:
             visit(tool_id, set())

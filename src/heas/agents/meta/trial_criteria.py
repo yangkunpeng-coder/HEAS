@@ -10,7 +10,7 @@ from pydantic import Field
 from heas.core.domain import Record
 
 
-class PolicyTrialCriteria(Record):
+class PolicyTrialCriteria(Record, frozen=True):
     """Define fixed statistical and cost gates outside the meta-evolution search space."""
 
     version: str = "paired-conservative-v1"
@@ -77,8 +77,8 @@ def assess_trial(
             result["reasons"].append("no_scalar_primary_metric")
             return result
         grouped.setdefault(key, []).extend(values)
-    samples = [value for values in grouped.values() for value in values]
-    repeat_means = [statistics.mean(values) for values in grouped.values()]
+    samples = [value for repeat_differences in grouped.values() for value in repeat_differences]
+    repeat_means = [statistics.mean(repeat_differences) for repeat_differences in grouped.values()]
     mean = statistics.mean(repeat_means)
     se = (
         statistics.stdev(repeat_means) / math.sqrt(len(repeat_means))

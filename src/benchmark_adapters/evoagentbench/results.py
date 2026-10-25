@@ -15,7 +15,11 @@ def verifier_metrics(
     raw = result.get("verifier_result", result)
     if not isinstance(raw, dict):
         raise BenchmarkProtocolError("official verifier result must be an object")
-    error = str(raw.get("error", ""))
+    error = raw.get("error")
+    if error is None:
+        error = ""
+    if not isinstance(error, str):
+        raise BenchmarkProtocolError("official verifier error must be text when supplied")
     if error and error != "no_code_extracted":
         return {}, None
     reward = raw.get("rewards", {}).get("reward") if isinstance(raw.get("rewards"), dict) else None

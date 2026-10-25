@@ -11,7 +11,7 @@ from typing import Any
 from benchmark_adapters.common.config import EvoAgentBenchConfig
 from benchmark_adapters.common.preflight import source_root
 from benchmark_adapters.common.process import BenchmarkBlocked
-from benchmark_adapters.common.protocol import OfficialReceipt
+from benchmark_adapters.common.protocol import OfficialReceipt, required_text
 from benchmark_adapters.evoagentbench.results import verifier_metrics
 from heas.core.errors import SecurityError
 from heas.infrastructure.storage import digest, encode
@@ -55,16 +55,16 @@ class EvoAgentBenchWorker:
                 raise SecurityError("unknown official task identity")
             args = argparse.Namespace(**{**vars(self.args), "task": native_id, "split": partition})
             rows = self.domain.load_tasks(args)
-            if len(rows) != 1 or str(rows[0].get("name")) != native_id:
+            if len(rows) != 1 or required_text(rows[0], "name") != native_id:
                 raise BenchmarkBlocked("official data are absent or task selection is ambiguous")
             self.tasks[native_id] = rows[0]
         return dict(self.tasks[native_id])
 
     def handle(self, operation: str, payload: dict[str, Any]) -> dict[str, Any]:
         """Dispatch the HEAS-owned bridge operations to verified official methods."""
-        session = str(payload["session_id"])
+        session = required_text(payload, "session_id")
         if operation == "prepare":
-            task = self._task(str(payload["official_task_id"]))
+            task = self._task(required_text(payload, "official_task_id"))
             job = self.root / "trials" / session
             trial_dir = job / f"{task['name']}__trial_1"
             trial_dir.mkdir(parents=True, exist_ok=False)
@@ -111,7 +111,7 @@ class EvoAgentBenchWorker:
             return self._action(env, payload)
         if operation != "evaluate":
             raise SecurityError("unsupported benchmark worker operation")
-        if str(task["name"]) != str(payload["official_task_id"]):
+        if required_text(task, "name") != required_text(payload, "official_task_id"):
             raise SecurityError("verifier task differs from the prepared task")
         if self.config.domain == "code_implementation" and not self.config.isolation_prefix:
             raise BenchmarkBlocked("generated solutions may only be verified in an isolated worker")
@@ -135,7 +135,7 @@ class EvoAgentBenchWorker:
         return OfficialReceipt(
             benchmark="evoagentbench",
             revision=self.config.revision,
-            official_task_id=str(task["name"]),
+            official_task_id=required_text(task, "name"),
             run_id=payload["run_id"],
             genome_id=payload["genome_id"],
             status="completed" if metrics else "not_available",
@@ -191,8 +191,13 @@ class EvoAgentBenchWorker:
 
     @staticmethod
     async def _mcp(url: str, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        from mcp import ClientSession
-        from mcp.client.sse import sse_client
+        try:
+            from mcp import ClientSession
+            from mcp.client.sse import sse_client
+        except ImportError as exc:
+            raise BenchmarkBlocked(
+                "MCP SDK is unavailable; install heas[mcp] in the configured worker interpreter"
+            ) from exc
 
         async with sse_client(url) as streams:
             async with ClientSession(*streams) as session:

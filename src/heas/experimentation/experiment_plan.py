@@ -9,7 +9,7 @@ from heas.core.domain import Budget, Id, ParentSelectionConfig, Record
 from heas.experimentation.suites import EvaluationSuiteSpec, TaskSuite
 
 
-class ExperimentPlan(Record):
+class ExperimentPlan(Record, frozen=True):
     """Freeze task suites, initial candidates, lifecycle limits, and resource budgets."""
 
     schema_version: Literal["1.2"] = "1.2"

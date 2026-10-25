@@ -2,7 +2,7 @@
 
 import difflib
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import Field
 
@@ -35,7 +35,7 @@ from heas.infrastructure.model import CallBudget, ModelGateway
 from heas.infrastructure.storage import FileStore, digest, redact
 
 
-class ProposalAnalysis(Record):
+class ProposalAnalysis(Record, frozen=True):
     """Validate a model's evidence-linked capability proposal before materialization."""
 
     parent_genome_ids: list[str] = Field(min_length=1)
@@ -45,7 +45,7 @@ class ProposalAnalysis(Record):
     verification_plan: str
 
 
-class DecisionAnalysis(Record):
+class DecisionAnalysis(Record, frozen=True):
     """Validate semantic parent selection and its explicitly uncertain rationale."""
 
     parent_genome_ids: list[str] = Field(min_length=1)
@@ -144,18 +144,30 @@ class GenomeMaterializer:
         Parent resources are read by version and hash. Approved Tool manifests are
         rechecked; proposed new source is quarantined rather than executed. Static
         validation of the child makes no claim about task-quality improvement.
+
+        Args:
+            proposal: Evidence-linked edits against explicit parent versions.
+
+        Returns:
+            A separate committed TaskGenome with lineage and capability changes.
+
+        Raises:
+            HEASError: A parent, edit target or capability dependency is invalid.
+            SecurityError: A Tool lacks Host approval or fails integrity checks.
         """
         parents = [self.store.genome(p) for p in proposal.parent_genome_ids]
+        if not parents:
+            raise HEASError("capability materialization requires at least one parent")
         first = parents[0]
         skills, tools = list(first.skills), list(first.tools)
         memory = self.store.verify(first.memory).decode("utf-8")
         provenance = [
             {
                 "source_genome_id": first.genome_id,
-                "source_artifact_id": ref.artifact_id,
-                "content_sha256": ref.content_sha256,
+                "source_artifact_id": parent_artifact.artifact_id,
+                "content_sha256": parent_artifact.content_sha256,
             }
-            for ref in [*first.skills, first.memory]
+            for parent_artifact in [*first.skills, first.memory]
         ]
         diffs: list[str] = []
         for op in proposal.operations:
@@ -214,11 +226,15 @@ class GenomeMaterializer:
                     )
                 continue
             if op.target_kind == "tool":
-                if op.tool and op.tool.generated_source:
+                tool_content = op.tool
+                generated_source = (
+                    tool_content.generated_source if tool_content is not None else None
+                )
+                if generated_source:
                     quarantine_id = uid("tool_proposal")
                     self.store.put_bytes(
                         f"quarantine/{quarantine_id}/proposed.py",
-                        redact(op.tool.generated_source).encode("utf-8"),
+                        redact(generated_source).encode("utf-8"),
                     )
                     self.store.put(
                         f"quarantine/{quarantine_id}/review.json",
@@ -237,9 +253,9 @@ class GenomeMaterializer:
                 if op.operation == "prune":
                     tools = [t for t in tools if t.tool_id != op.target_ref]
                 else:
-                    if op.tool is None or op.tool.binding is None:
+                    binding = tool_content.binding if tool_content is not None else None
+                    if binding is None:
                         raise HEASError("typed tool binding required")
-                    binding = op.tool.binding
                     self.validator.tools.validate(binding)
                     tools = [
                         t
@@ -257,12 +273,13 @@ class GenomeMaterializer:
                 if op.operation == "prune":
                     memory = "# Memory\nNo retained knowledge.\n"
                 else:
-                    if op.memory is None:
+                    memory_content = op.memory
+                    if memory_content is None:
                         raise HEASError("typed memory content required")
                     memory = (
-                        op.memory.content
+                        memory_content.content
                         if op.operation == "mutate"
-                        else (memory + "\n" + op.memory.content)
+                        else (memory + "\n" + memory_content.content)
                     )
                 new = memory
             else:
@@ -274,19 +291,20 @@ class GenomeMaterializer:
                     skills.remove(ref)
                 new = ""
                 if op.operation != "prune":
-                    if op.skill is None:
+                    skill_content = op.skill
+                    if skill_content is None:
                         raise HEASError("typed skill content required")
-                    new = op.skill.content
+                    new = skill_content.content
                     if redact(new) != new:
                         raise SecurityError("credential-like content in capability")
                     skills.append(
                         self.store.skill(
                             new,
-                            op.skill.requires_tools,
-                            op.skill.selection_tags,
-                            applicability=op.skill.applicability,
-                            conflicts_with=op.skill.conflicts_with,
-                            constraints=op.skill.constraints,
+                            skill_content.requires_tools,
+                            skill_content.selection_tags,
+                            applicability=skill_content.applicability,
+                            conflicts_with=skill_content.conflicts_with,
+                            constraints=skill_content.constraints,
                         )
                     )
             if redact(new) != new:
@@ -403,7 +421,7 @@ class EvolutionService:
         meter = CallBudget(self.budget)
         offspring: list[str] = []
         errors: list[str] = []
-        status: Any = "failed"
+        status: Literal["failed", "materialized", "quarantined"] = "failed"
         try:
             context = self._diagnose(summaries, policy, proposal_override, meter, progress)
             proposal = self._propose(context, policy, proposal_override, meter, progress)
@@ -541,10 +559,9 @@ class EvolutionService:
             policy_id=policy.policy_id,
             **diagnosis.model_dump(exclude={"schema_version", "extensions"}),
         )
-        progress.decision_uri = f"{directory}/decision.json"
-        self.store.save_record(
-            progress.decision_uri, decision, "evolution_decision", decision.decision_id
-        )
+        decision_uri = f"{directory}/decision.json"
+        progress.decision_uri = decision_uri
+        self.store.save_record(decision_uri, decision, "evolution_decision", decision.decision_id)
         progress.parent_ids = decision.parent_genome_ids
         return _EvolutionContext(summaries, refs, supporting_evidence, decision)
 

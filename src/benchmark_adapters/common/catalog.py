@@ -3,7 +3,7 @@
 from collections.abc import Mapping
 
 from benchmark_adapters.common.config import require_partition_map
-from benchmark_adapters.common.protocol import PublicTask
+from benchmark_adapters.common.protocol import PublicTask, required_text
 from heas.core.domain import TaskSpec
 from heas.core.errors import HEASError
 
@@ -50,4 +50,4 @@ class CatalogProvider:
 
     def native_id(self, task_id: str) -> str:
         """Return the original official identity for a Core execution receipt."""
-        return str(self.get_task(task_id).metadata["official_task_id"])
+        return required_text(self.get_task(task_id).metadata, "official_task_id")

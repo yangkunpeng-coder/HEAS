@@ -1,7 +1,7 @@
 """Task-suite plan organization and host-side evaluation composition without domain rules."""
 
 from pathlib import Path
-from typing import Any
+from typing import Any as Any
 
 from pydantic import Field, model_validator
 
@@ -17,11 +17,13 @@ from heas.core.domain import (
     uid,
 )
 from heas.core.errors import HEASError
+from heas.core.ports import StructuredTaskEvaluator, TaskEvaluator
+from heas.experimentation.ports import ExperimentServices
 from heas.infrastructure.adapters import AdapterRegistry
 from heas.infrastructure.storage import FileStore
 
 
-class TaskSuiteGroup(Record):
+class TaskSuiteGroup(Record, frozen=True):
     """Bind authorized task instances to one provider/environment pair."""
 
     provider_id: Id
@@ -29,7 +31,7 @@ class TaskSuiteGroup(Record):
     task_ids: list[Id] = Field(min_length=1)
 
 
-class TaskSuite(Record):
+class TaskSuite(Record, frozen=True):
     """Group independent task runs under a versioned, explicit partition."""
 
     suite_id: Id
@@ -46,7 +48,7 @@ class TaskSuite(Record):
         return self
 
 
-class EvaluationSuiteSpec(Record):
+class EvaluationSuiteSpec(Record, frozen=True):
     """Freeze evaluator versions and an optional scalar selection objective."""
 
     suite_id: Id
@@ -88,11 +90,12 @@ class EvaluationSuite:
         versions: dict[str, str] = {}
         for evaluator_id in self.spec.evaluator_ids:
             adapter = self.registry.evaluators[evaluator_id]
-            raw = (
-                adapter.evaluate_result(task, run, result, workspace)
-                if hasattr(adapter, "evaluate_result")
-                else adapter.evaluate(task, run, result.text or "", workspace)
-            )
+            if isinstance(adapter, StructuredTaskEvaluator):
+                raw = adapter.evaluate_result(task, run, result, workspace)
+            elif isinstance(adapter, TaskEvaluator):
+                raw = adapter.evaluate(task, run, result.text or "", workspace)
+            else:
+                raise HEASError("registered evaluator does not implement a task evaluation port")
             feedback = EvaluationResult.model_validate(raw)
             if feedback.run_id != run.run_id or feedback.evaluator_id != evaluator_id:
                 raise HEASError("suite evaluator receipt identity mismatch")
@@ -116,8 +119,9 @@ class EvaluationSuite:
         if complete:
             for feedback in feedbacks:
                 own = {f"{s.source}:{s.name}": s for s in feedback.scores}
-                if feedback.score:
-                    own[f"{feedback.score.source}:{feedback.score.name}"] = feedback.score
+                primary_score = feedback.score
+                if primary_score is not None:
+                    own[f"{primary_score.source}:{primary_score.name}"] = primary_score
                 for key, score in own.items():
                     if key in metrics:
                         raise HEASError("duplicate evaluation suite metric namespace: " + key)
@@ -190,7 +194,7 @@ def compile_suite(
 
 
 def run_suite(
-    services: Any,
+    services: ExperimentServices,
     suite: TaskSuite,
     genome_ids: list[str],
     evaluation: EvaluationSuiteSpec | None = None,

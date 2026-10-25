@@ -11,6 +11,7 @@ from heas.core.domain import EvidenceRef, MetaPolicyTrial, RunPlan, now, uid
 from heas.core.errors import HEASError, RecoveryRequired, SecurityError
 from heas.experimentation.isolation import IsolatedPolicyTrialRunner
 from heas.experimentation.metrics import measured, unknown
+from heas.experimentation.ports import ExperimentServices
 from heas.infrastructure.model import CallBudget
 from heas.infrastructure.resources import ResourceLedger
 from heas.infrastructure.storage import FileStore, digest, encode
@@ -28,7 +29,8 @@ class PolicyMetrics:
             self.store.resolve(EvidenceRef(ref_type="policy_trial", ref_id=trial_id))
         )
         spec = self.store.load(f"meta/trials/{trial_id}/spec.json", PolicyTrialSpec)
-        data = self.store.read(trial.objective_metrics_ref) if trial.objective_metrics_ref else {}
+        metrics_uri = trial.objective_metrics_ref
+        data = self.store.read_object(metrics_uri) if metrics_uri is not None else {}
         fresh = [
             compare_windows(self.store, row["old_run_ids"], row["new_run_ids"])
             for row in data.get("round_comparisons", [])
@@ -71,7 +73,9 @@ class PolicyMetrics:
         self.store.put(f"metrics/policy_selections/{selection_id}.json", selection)
         return selection
 
-    def final_report(self, services: Any, selection_id: str, final_plan: RunPlan) -> dict[str, Any]:
+    def final_report(
+        self, services: ExperimentServices, selection_id: str, final_plan: RunPlan
+    ) -> dict[str, Any]:
         """Train paired frozen policies independently, then evaluate their last child once.
 
         Final scores are report-only: they never enter an attempt reflection,
@@ -90,7 +94,7 @@ class PolicyMetrics:
         if self.store.path(f"{directory}/report.json").exists():
             if self.store.read(f"{directory}/request.json") != request:
                 raise HEASError("frozen final report request changed")
-            return self.store.read(f"{directory}/report.json")
+            return self.store.read_object(f"{directory}/report.json")
         if self.store.path(f"{directory}/request.json").exists():
             raise RecoveryRequired("interrupted policy final report cannot be blindly replayed")
         self.store.put(f"{directory}/request.json", request)
@@ -138,7 +142,10 @@ class PolicyMetrics:
                         child_ids: list[str] = []
                         for _ in range(spec.steps_per_policy):
                             outcome = branch.engine.step(pool, policy, training, compare=False)
-                            child_ids = [child["genome_id"] for child in outcome["offspring"]]
+                            child_ids = [
+                                offspring_record["genome_id"]
+                                for offspring_record in outcome["offspring"]
+                            ]
                             for child in outcome["offspring"]:
                                 if child["summary_id"]:
                                     from heas.core.domain import TaskExperienceSummary

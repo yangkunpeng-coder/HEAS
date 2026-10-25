@@ -8,7 +8,7 @@ from heas.agents.task.runtime import TaskRunService
 from heas.core.domain import EvolutionAttemptRecord, EvolutionPolicy, RunPlan, TaskExperienceSummary
 from heas.core.errors import BudgetExceeded, HEASError, RecoveryRequired
 from heas.evidence.experience import ExperienceService
-from heas.infrastructure.resources import ResourceLedger
+from heas.infrastructure.resources import ResourceCheckpoint, ResourceLedger
 from heas.infrastructure.storage import FileStore, digest
 
 
@@ -154,11 +154,11 @@ class EvolutionEngine:
         return {"attempt": attempt, **outcome, "feedback_completion": completion}
 
     def _feedback(
-        self, attempt: EvolutionAttemptRecord, directory: str, checkpoint: Any
+        self, attempt: EvolutionAttemptRecord, directory: str, checkpoint: ResourceCheckpoint
     ) -> dict[str, Any]:
         uri = f"{directory}/feedback_completion.json"
         if self.store.path(uri).exists():
-            return self.store.read(uri)
+            return self.store.read_object(uri)
         status, error_type = "completed", None
         try:
             self.experience.reflect_attempt(attempt)

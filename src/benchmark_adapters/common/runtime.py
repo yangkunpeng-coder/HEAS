@@ -2,7 +2,7 @@
 
 import time
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -20,6 +20,16 @@ from heas.core.domain import (
 from heas.core.errors import HEASError, SecurityError
 from heas.infrastructure.model import CallBudget, ModelGateway
 from heas.infrastructure.storage import FileStore, digest, encode
+
+
+@runtime_checkable
+class BridgedEnvironment(Protocol):
+    """Expose an optional Host bridge for cleanup without requiring a concrete adapter."""
+
+    @property
+    def bridge(self) -> RunnerBridge:
+        """Return the independently owned worker transport to close after execution."""
+        ...
 
 
 class BenchmarkAction(BaseModel):
@@ -78,7 +88,12 @@ class BenchmarkEnvironment:
     @property
     def input_fingerprint(self) -> str | None:
         """Return the worker's public input digest for independent comparison checks."""
-        return self.public_state.get("task_input_sha256")
+        fingerprint = self.public_state.get("task_input_sha256")
+        if fingerprint is None:
+            return None
+        if not isinstance(fingerprint, str):
+            raise HEASError("worker input fingerprint must be text when supplied")
+        return fingerprint
 
     def observe(self) -> AgentObservation:
         """Return public environment state, never an official validator specification."""
@@ -172,11 +187,12 @@ class BenchmarkEvaluator:
         try:
             return self._evaluate(task, run, result, workspace)
         finally:
-            if self.environment.pending_session:
+            pending_session = self.environment.pending_session
+            if pending_session is not None:
                 try:
                     self.environment.bridge.request(
                         "cleanup",
-                        {"session_id": self.environment.pending_session},
+                        {"session_id": pending_session},
                         timeout=self.config.timeout_seconds,
                     )
                 finally:
@@ -189,13 +205,17 @@ class BenchmarkEvaluator:
         root = "benchmark_invocations"
         plan = self.store.load(f"plans/{run.run_plan_id}.json", RunPlan)
         meter = CallBudget(plan.budget)
+        gateway = self.gateway
         meter.scope_id = f"run:{run.run_id}"
         meter.started -= run.usage.wall_seconds
-        scopes = self.gateway.meters(meter) if self.gateway else [meter]
+        scopes = gateway.meters(meter) if gateway is not None else [meter]
         for scope in scopes:
             scope.check()
-        timeout = min(self.config.timeout_seconds, *(scope.remaining_time for scope in scopes))
-        require_external_budget_support([scope.budget for scope in scopes])
+        timeout = min(
+            self.config.timeout_seconds,
+            *(resource_scope.remaining_time for resource_scope in scopes),
+        )
+        require_external_budget_support([resource_scope.budget for resource_scope in scopes])
         if len(list(self.store.path(root).glob("*.json"))) >= self.config.max_evaluations:
             raise HEASError("official evaluation invocation budget exhausted")
         invocation = {
@@ -205,9 +225,9 @@ class BenchmarkEvaluator:
             "genome_id": run.genome_id,
             "usage_status": "unknown_external_usage",
             "task_partition": run.task_partition,
-            "budget_scope_ids": self.gateway.scope_ids(meter) if self.gateway else [],
+            "budget_scope_ids": gateway.scope_ids(meter) if gateway is not None else [],
         }
-        for target in [self.store, *(self.gateway.audit_mirrors if self.gateway else [])]:
+        for target in [self.store, *(gateway.audit_mirrors if gateway is not None else [])]:
             target.put(f"{root}/{run.run_id}.json", invocation)
         started = time.monotonic()
         try:
@@ -301,7 +321,7 @@ class BenchmarkEvaluator:
             )
         finally:
             completion = {**invocation, "wall_seconds": time.monotonic() - started}
-            for target in [self.store, *(self.gateway.audit_mirrors if self.gateway else [])]:
+            for target in [self.store, *(gateway.audit_mirrors if gateway is not None else [])]:
                 target.put(f"benchmark_completions/{run.run_id}.json", completion)
             self.environment.bridge.request(
                 "cleanup", {"session_id": run.run_id}, timeout=self.config.timeout_seconds

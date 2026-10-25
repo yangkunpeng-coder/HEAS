@@ -14,13 +14,13 @@ from heas.agents.evolution.candidates import (
     comparison_protocol,
     external_score,
 )
-from heas.core.domain import EvaluationResult, EvidenceRef, Id, Record, now
+from heas.core.domain import EvaluationResult, EvidenceRef, Id, Record, heas_ext, now
 from heas.core.errors import HEASError, SecurityError
 from heas.infrastructure.resources import ResourceLedger
 from heas.infrastructure.storage import FileStore, digest, encode
 
 
-class MetricValue(Record):
+class MetricValue(Record, frozen=True):
     """Represent a derived value together with its inputs and missing-evidence reason."""
 
     status: Literal["completed", "not_available"]
@@ -41,7 +41,7 @@ def measured(value: float, unit: str, evidence: list[str]) -> MetricValue:
     return MetricValue(status="completed", value=value, unit=unit, evidence_ids=evidence)
 
 
-class FrozenSelection(Record):
+class FrozenSelection(Record, frozen=True):
     """Record a validation-selected genome before any final-test execution."""
 
     selection_id: Id
@@ -72,7 +72,7 @@ class EvolutionMetrics:
             feedback = EvaluationResult.model_validate(
                 self.store.resolve(EvidenceRef(ref_type="feedback", ref_id=run.run_id))
             )
-            success = feedback.extensions.get("heas", {}).get("success")
+            success = heas_ext(feedback).get("success")
             if not isinstance(success, bool):
                 return unknown("ratio", "evaluator did not define binary success")
             outcomes.append(success)
@@ -104,12 +104,16 @@ class EvolutionMetrics:
         """
         if not windows:
             raise HEASError("validation candidate windows are required")
-        runs = [archived_runs(self.store, ids) for ids in windows]
-        if any(r.task_partition != "evolution_validation" for group in runs for r in group):
+        runs = [archived_runs(self.store, candidate_run_ids) for candidate_run_ids in windows]
+        if any(
+            r.task_partition != "evolution_validation"
+            for candidate_runs in runs
+            for r in candidate_runs
+        ):
             raise SecurityError("candidate selection requires evolution_validation only")
-        gids = [group[0].genome_id for group in runs]
+        gids = [candidate_runs[0].genome_id for candidate_runs in runs]
         if len(gids) != len(set(gids)) or any(
-            len({r.genome_id for r in group}) != 1 for group in runs
+            len({r.genome_id for r in candidate_runs}) != 1 for candidate_runs in runs
         ):
             raise HEASError("each candidate must have one distinct frozen validation window")
         self.store.genome(baseline_genome_id)
@@ -137,7 +141,7 @@ class EvolutionMetrics:
             genome_id=gids[max(range(len(values)), key=values.__getitem__)],
             baseline_genome_id=baseline_genome_id,
             policy_id=policy_id,
-            validation_run_ids=[r.run_id for group in runs for r in group],
+            validation_run_ids=[r.run_id for candidate_runs in runs for r in candidate_runs],
             candidate_genome_ids=gids,
             k=len(gids),
             validation_protocol_sha256=comparison_protocol(self.store, runs[0]),

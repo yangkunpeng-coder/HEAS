@@ -1,7 +1,7 @@
 """Core depends only on these ports, never on task-specific adapters."""
 
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 from heas.core.domain import AgentObservation, EvaluationResult, TaskResult, TaskRunRecord, TaskSpec
 
@@ -23,6 +23,7 @@ class ModelClient(Protocol):
         ...
 
 
+@runtime_checkable
 class TaskProvider(Protocol):
     """Supply public task instances with explicit partition access checks."""
 
@@ -37,6 +38,7 @@ class TaskProvider(Protocol):
         ...
 
 
+@runtime_checkable
 class TaskEnvironment(Protocol):
     """Own the lifecycle and public observations of one independent task execution."""
 
@@ -59,6 +61,7 @@ class TaskEnvironment(Protocol):
         ...
 
 
+@runtime_checkable
 class TaskEvaluator(Protocol):
     """Evaluate a completed text result independently from the solving model."""
 
@@ -71,6 +74,7 @@ class TaskEvaluator(Protocol):
         ...
 
 
+@runtime_checkable
 class StructuredTaskEvaluator(Protocol):
     """Evaluate structured results and artifacts using an independent host protocol."""
 
@@ -83,9 +87,20 @@ class StructuredTaskEvaluator(Protocol):
         ...
 
 
+@runtime_checkable
 class ToolExecutor(Protocol):
     """Invoke a host-approved implementation within a bounded execution timeout."""
 
     def execute(self, tool_id: str, args: dict[str, Any], *, timeout: float) -> Any:
         """Invoke the Host-approved tool with validated arguments and a time limit."""
+        ...
+
+
+@runtime_checkable
+class FingerprintedEnvironment(Protocol):
+    """Optionally expose the public input digest without extending every environment."""
+
+    @property
+    def input_fingerprint(self) -> str | None:
+        """Return a Host input digest, or None when the adapter has no digest."""
         ...

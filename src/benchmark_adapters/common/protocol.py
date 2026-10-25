@@ -5,10 +5,28 @@ from typing import Any, Literal, Protocol
 from pydantic import Field
 
 from heas.core.domain import Id, Record, TaskSpec
+from heas.core.errors import HEASError
 from heas.infrastructure.storage import digest
 
 
-class PublicTask(Record):
+def required_text(payload: dict[str, Any], field: str, *, allow_empty: bool = False) -> str:
+    """Read required protocol text without coercing missing values into identities.
+
+    Args:
+        payload: Untrusted decoded worker data or task metadata.
+        field: Host-defined field name, safe to include in diagnostics.
+        allow_empty: Permit an empty answer while retaining string type validation.
+
+    Raises:
+        HEASError: The required field is missing, None, or incompatible text.
+    """
+    value = payload.get(field)
+    if not isinstance(value, str) or (not allow_empty and not value):
+        raise HEASError("required protocol text is missing or invalid: " + field)
+    return value
+
+
+class PublicTask(Record, frozen=True):
     """Expose task identity and instructions while retaining rubrics in the worker."""
 
     official_task_id: str = Field(min_length=1)
@@ -45,7 +63,7 @@ class PublicTask(Record):
         )
 
 
-class OfficialReceipt(Record):
+class OfficialReceipt(Record, frozen=True):
     """Retain only finite official metrics, execution identity, and public provenance."""
 
     benchmark: str

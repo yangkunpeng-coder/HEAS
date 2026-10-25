@@ -7,11 +7,12 @@ from pydantic import Field
 from heas.agents.evolution.candidates import compare_windows
 from heas.core.domain import Budget, EvidenceRef, Id, Record, RunPlan, uid
 from heas.core.errors import HEASError
+from heas.experimentation.ports import ExperimentServices
 from heas.infrastructure.model import CallBudget
 from heas.infrastructure.resources import ResourceLedger
 
 
-class AblationCondition(Record):
+class AblationCondition(Record, frozen=True):
     """Describe an immutable host-created variant and its capability-change evidence."""
 
     label: Id
@@ -20,7 +21,7 @@ class AblationCondition(Record):
     operation_evidence_refs: list[EvidenceRef] = Field(default_factory=list)
 
 
-class AttributionSpec(Record):
+class AttributionSpec(Record, frozen=True):
     """Freeze matched ablation conditions without asserting causal attribution."""
 
     experiment_id: Id
@@ -35,7 +36,7 @@ class AttributionSpec(Record):
 class AttributionExperimentRunner:
     """Execute host-defined matched capability variants without assuming causality."""
 
-    def __init__(self, services: Any):
+    def __init__(self, services: ExperimentServices):
         self.services = services
         self.store = services.store
 

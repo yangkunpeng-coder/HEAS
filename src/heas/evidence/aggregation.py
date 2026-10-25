@@ -11,7 +11,7 @@ from heas.infrastructure.model import CallBudget, ModelGateway
 from heas.infrastructure.storage import FileStore, encode
 
 
-class AggregationConfig(Record):
+class AggregationConfig(Record, frozen=True):
     """Bound hierarchy size so experience reports retain evidence within context limits."""
 
     batch_size: int = Field(default=4, ge=2, le=32)
@@ -137,5 +137,5 @@ class HierarchicalExperienceAggregator:
                     },
                 )
                 return outputs[0][1], manifest_uri
-            current = [node for node, _ in outputs]
+            current = [summary_node for summary_node, _ in outputs]
             level += 1

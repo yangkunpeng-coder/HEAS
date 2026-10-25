@@ -6,7 +6,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
-from heas.agents.evolution.candidates import archived_runs
+from heas.agents.evolution.candidates import CandidateRegistry, archived_runs
 from heas.agents.meta.meta import load_policy
 from heas.agents.meta.policy_trials import EvolutionPolicyManager, PolicyTrialService
 from heas.core.domain import (
@@ -20,19 +20,24 @@ from heas.core.domain import (
 )
 from heas.core.errors import BudgetExceeded, HEASError, RecoveryRequired
 from heas.experimentation.experiment_plan import ExperimentPlan
+from heas.experimentation.ports import ExperimentServices
 from heas.experimentation.suites import EvaluationSuite, TaskSuite, compile_suite
 from heas.infrastructure.model import CallBudget
 from heas.infrastructure.reproducibility import export_manifest
 from heas.infrastructure.resources import ResourceCheckpoint, ResourceLedger
-from heas.infrastructure.storage import digest
+from heas.infrastructure.storage import FileStore, digest
 
 
-class EvolutionExperimentController:
-    """Schedule bounded L1/L2/L3 cycles with durable recovery checkpoints."""
+class ExperimentControl:
+    """Inspect durable experiment state and queue Host requests without model services."""
 
-    def __init__(self, services: Any, on_checkpoint: Callable[[str], None] | None = None):
-        self.services, self.store = services, services.store
-        self.on_checkpoint = on_checkpoint
+    def __init__(self, store: FileStore):
+        self.store = store
+
+    @property
+    def candidates(self) -> CandidateRegistry:
+        """Read candidate state from the same workspace without constructing execution services."""
+        return CandidateRegistry(self.store)
 
     @staticmethod
     def directory(experiment_id: str) -> str:
@@ -43,6 +48,94 @@ class EvolutionExperimentController:
         from heas.core.domain import Id
 
         return f"experiments/evolution/{TypeAdapter(Id).validate_python(experiment_id)}"
+
+    def status(self, eid: str) -> dict[str, Any]:
+        """Read the last committed lifecycle event and completed cycle count."""
+        directory = self.directory(eid)
+        self.store.load(f"{directory}/plan.json", ExperimentPlan)
+        events = sorted(self.store.path(f"{directory}/events").glob("*.json"))
+        if not events:
+            raise RecoveryRequired("experiment plan has no committed lifecycle event")
+        event = self.store.read_object(events[-1].relative_to(self.store.root).as_posix())
+        cycles = sorted(self.store.path(f"{directory}/cycles").glob("*/completed.json"))
+        return {"experiment_id": eid, **event, "completed_cycles": len(cycles)}
+
+    def request(self, eid: str, action: str) -> dict[str, Any]:
+        """Queue a host pause or cancellation request for the next stage boundary."""
+        if action not in {"pause", "cancel"}:
+            raise HEASError("unsupported lifecycle action")
+        if self.status(eid)["status"] in {"completed", "cancelled", "failed"}:
+            raise HEASError("experiment is already terminal")
+        directory = self.directory(eid)
+        n = len(list(self.store.path(f"{directory}/requests").glob("*.json"))) + 1
+        self.store.put(f"{directory}/requests/{n:06d}.json", {"action": action})
+        # Consumed at a stage boundary; CLI remains truthful about pending requests.
+        return {**self.status(eid), "requested_action": action}
+
+    def _resources(self, eid: str) -> dict[str, Any]:
+        origin = self.store.read(f"{self.directory(eid)}/resource_origin.json")
+        return ResourceLedger(self.store).report(
+            ResourceCheckpoint(set(origin["calls"]), set(origin["runs"]), set(origin["tools"])),
+            scope_id=origin.get("scope_id"),
+        )
+
+    def report(self, eid: str) -> dict[str, Any]:
+        """Read evidence and resource accounting without making model calls."""
+        directory = self.directory(eid)
+        reports = sorted(self.store.path(f"{directory}/reports").glob("*.json"))
+        stages = [
+            {
+                "stage": p.parent.name,
+                "cycle": p.parent.parent.parent.name,
+                "record_ref": p.relative_to(self.store.root).as_posix(),
+                **self.store.read(p.relative_to(self.store.root).as_posix())["result"],
+            }
+            for p in sorted(
+                self.store.path(f"{directory}/cycles").glob("*/stages/*/completed.json")
+            )
+        ]
+        return {
+            **self.status(eid),
+            "workspace": str(self.store.root),
+            "plan_ref": f"{directory}/plan.json",
+            "report_ref": reports[-1].relative_to(self.store.root).as_posix() if reports else None,
+            "reproducibility_ref": self.store.read(f"{directory}/reproducibility.json")[
+                "manifest_ref"
+            ]
+            if self.store.path(f"{directory}/reproducibility.json").exists()
+            else None,
+            "stages": stages,
+            "active_policy_id": EvolutionPolicyManager(self.store).active(),
+            "incumbent_genome_id": self.candidates.incumbent(),
+            "resources": self._resources(eid),
+            "limitations": [
+                "Synthetic runs establish engineering behavior only.",
+                "Unavailable independent evaluation implies unknown improvement.",
+            ],
+            "quality_improvement": "unknown"
+            if not any(
+                c.get("comparison_status") == "improved"
+                for stage in stages
+                for c in stage.get("candidates", [])
+            )
+            else "observed_in_configured_evaluation",
+        }
+
+
+class EvolutionExperimentController(ExperimentControl):
+    """Schedule bounded L1/L2/L3 cycles with durable recovery checkpoints."""
+
+    def __init__(
+        self, services: ExperimentServices, on_checkpoint: Callable[[str], None] | None = None
+    ):
+        super().__init__(services.store)
+        self.services = services
+        self.on_checkpoint = on_checkpoint
+
+    @property
+    def candidates(self) -> CandidateRegistry:
+        """Use the injected execution registry for live experiment reports."""
+        return self.services.candidates
 
     def create(self, plan: ExperimentPlan) -> None:
         """Initialize the immutable host configuration or an independent execution branch."""
@@ -97,44 +190,20 @@ class EvolutionExperimentController:
             },
         )
 
-    def status(self, eid: str) -> dict[str, Any]:
-        """Read the last committed lifecycle event and completed cycle count."""
-        directory = self.directory(eid)
-        self.store.load(f"{directory}/plan.json", ExperimentPlan)
-        events = sorted(self.store.path(f"{directory}/events").glob("*.json"))
-        event = self.store.read(events[-1].relative_to(self.store.root).as_posix())
-        cycles = sorted(self.store.path(f"{directory}/cycles").glob("*/completed.json"))
-        return {"experiment_id": eid, **event, "completed_cycles": len(cycles)}
-
-    def request(self, eid: str, action: str) -> dict[str, Any]:
-        """Queue a host pause or cancellation request for the next stage boundary."""
-        if action not in {"pause", "cancel"}:
-            raise HEASError("unsupported lifecycle action")
-        if self.status(eid)["status"] in {"completed", "cancelled", "failed"}:
-            raise HEASError("experiment is already terminal")
-        directory = self.directory(eid)
-        n = len(list(self.store.path(f"{directory}/requests").glob("*.json"))) + 1
-        self.store.put(f"{directory}/requests/{n:06d}.json", {"action": action})
-        # Consumed at a stage boundary; CLI remains truthful about pending requests.
-        return {**self.status(eid), "requested_action": action}
-
     def _requested(self, eid: str) -> str | None:
         directory = self.directory(eid)
         paths = sorted(self.store.path(f"{directory}/requests").glob("*.json"))
         for path in paths:
             marker = f"{directory}/consumed_requests/{path.name}"
             if not self.store.path(marker).exists():
-                action = self.store.read(path.relative_to(self.store.root).as_posix())["action"]
+                action = self.store.read_object(path.relative_to(self.store.root).as_posix()).get(
+                    "action"
+                )
+                if not isinstance(action, str) or action not in {"pause", "cancel"}:
+                    raise RecoveryRequired("invalid lifecycle request; inspect before consuming")
                 self.store.put(marker, {"consumed": True})
-                return str(action)
+                return action
         return None
-
-    def _resources(self, eid: str) -> dict[str, Any]:
-        origin = self.store.read(f"{self.directory(eid)}/resource_origin.json")
-        return ResourceLedger(self.store).report(
-            ResourceCheckpoint(set(origin["calls"]), set(origin["runs"]), set(origin["tools"])),
-            scope_id=origin.get("scope_id"),
-        )
 
     def _stage(
         self,
@@ -148,7 +217,10 @@ class EvolutionExperimentController:
         directory = f"{self.directory(eid)}/cycles/{cycle:04d}/stages/{name}"
         uri = f"{directory}/completed.json"
         if self.store.path(uri).exists():
-            return self.store.read(uri)["result"]
+            result = self.store.read_object(uri).get("result")
+            if not isinstance(result, dict):
+                raise RecoveryRequired("completed stage has no valid result; do not replay")
+            return result
         action = self._requested(eid)
         if action:
             self._event(eid, "paused" if action == "pause" else "cancelled", "host_request")
@@ -344,6 +416,8 @@ class EvolutionExperimentController:
             raise BudgetExceeded("experiment call budget exhausted")
         active = EvolutionPolicyManager(self.store).active()
         policy_id = exploratory or active
+        if not policy_id:
+            raise RecoveryRequired("experiment has no selected policy; inspect activations")
         selection = self._stage(
             eid,
             cycle,
@@ -355,7 +429,10 @@ class EvolutionExperimentController:
                 usage="exploratory" if exploratory else "approved",
             ),
         )
-        policy = load_policy(self.store, selection["policy_id"])
+        selected_policy_id = selection.get("policy_id")
+        if not isinstance(selected_policy_id, str) or not selected_policy_id:
+            raise RecoveryRequired("policy checkpoint has no valid policy identity")
+        policy = load_policy(self.store, selected_policy_id)
         templates = self._plans(plan, cycle, "training", plan.training_suite, gids)
         batch = self._stage(
             eid,
@@ -405,21 +482,21 @@ class EvolutionExperimentController:
             aid = "attempt_" + digest(f"{eid}|{cycle}|{number}".encode())[7:39]
 
             def evolve(
-                pool: Any = pool,
-                policy: Any = policy,
-                templates: Any = templates,
-                aid: str = aid,
+                experience_pool: list[TaskExperienceSummary] = pool,
+                evolution_policy: EvolutionPolicy = policy,
+                execution_templates: list[RunPlan] = templates,
+                attempt_id: str = aid,
             ) -> dict[str, Any]:
                 outcome = services.engine.step(
-                    pool,
-                    policy,
-                    templates,
+                    experience_pool,
+                    evolution_policy,
+                    execution_templates,
                     compare=plan.validation_suite is None,
-                    attempt_id=aid,
+                    attempt_id=attempt_id,
                     resume=True,
                 )
                 return {
-                    "attempt_id": aid,
+                    "attempt_id": attempt_id,
                     "children": [c["genome_id"] for c in outcome["offspring"]],
                     "summary_ids": [
                         c["summary_id"] for c in outcome["offspring"] if c["summary_id"]
@@ -441,12 +518,14 @@ class EvolutionExperimentController:
     ) -> None:
         """Run independent candidate checks before recording comparison feedback."""
         eid, services = plan.experiment_id, self.services
-        if plan.validation_suite and children:
+        validation_suite = plan.validation_suite
+        if validation_suite and children:
             reference = services.candidates.incumbent()
-            validate_gids = list(dict.fromkeys([*([reference] if reference else []), *children]))
-            validation = self._plans(
-                plan, cycle, "validation", plan.validation_suite, validate_gids
-            )
+            validation_genomes = children.copy()
+            if reference:
+                validation_genomes.insert(0, reference)
+            validate_gids = list(dict.fromkeys(validation_genomes))
+            validation = self._plans(plan, cycle, "validation", validation_suite, validate_gids)
             self._stage(
                 eid,
                 cycle,
@@ -455,10 +534,10 @@ class EvolutionExperimentController:
                 recoverable=True,
             )
 
-        def compare(children: Any = children) -> dict[str, Any]:
+        def compare(offspring_ids: list[str] = children) -> dict[str, Any]:
             """Compare a candidate against its reference using independently matched evidence."""
             comparisons = []
-            for gid in children:
+            for gid in offspring_ids:
                 current = services.candidates.get(gid)
                 if current.run_ids and services.candidates.incumbent() != gid:
                     current = services.candidates.compare(gid)
@@ -470,8 +549,8 @@ class EvolutionExperimentController:
         self._stage(eid, cycle, "comparison", compare, recoverable=True)
         if plan.validation_suite:
 
-            def feedback(attempts: Any = attempts) -> dict[str, Any]:
-                for aid in attempts:
+            def feedback(attempt_ids: list[str] = attempts) -> dict[str, Any]:
+                for aid in attempt_ids:
                     attempt = self.store.load(
                         f"evolution/attempts/{aid}/attempt.json", EvolutionAttemptRecord
                     )
@@ -496,7 +575,7 @@ class EvolutionExperimentController:
                             },
                         )
                         services.experience.reflect_attempt(attempt)
-                return {"attempt_ids": attempts}
+                return {"attempt_ids": attempt_ids}
 
             self._stage(eid, cycle, "validation_feedback", feedback, recoverable=True)
 
@@ -529,35 +608,45 @@ class EvolutionExperimentController:
                     partial(self._evolution_summary, rows),
                 )
 
-                def propose(es: Any = es, policy: Any = policy) -> dict[str, Any]:
+                def propose(
+                    experience_checkpoint: dict[str, Any] = es,
+                    source_policy: EvolutionPolicy = policy,
+                ) -> dict[str, Any]:
                     """Propose a child policy that still requires independent evaluation."""
                     summary = EvolutionExperienceSummary.model_validate(
-                        self.store.resolve(EvidenceRef(ref_type="summary", ref_id=es["summary_id"]))
+                        self.store.resolve(
+                            EvidenceRef(
+                                ref_type="summary", ref_id=experience_checkpoint["summary_id"]
+                            )
+                        )
                     )
-                    candidate, proposal = services.meta.propose(
-                        summary, policy, {"requires_matched_independent_trial": True}
+                    candidate, policy_proposal = services.meta.propose(
+                        summary, source_policy, {"requires_matched_independent_trial": True}
                     )
                     return {
                         "policy_id": candidate.policy_id,
-                        "proposal_id": proposal.proposal_id,
+                        "proposal_id": policy_proposal.proposal_id,
                     }
 
                 proposal = self._stage(eid, cycle, "meta", propose)
 
                 def trial(
-                    cycle: int = cycle, policy: Any = policy, proposal: Any = proposal
+                    cycle_number: int = cycle,
+                    reference_policy: EvolutionPolicy = policy,
+                    proposal_checkpoint: dict[str, Any] = proposal,
                 ) -> dict[str, Any]:
-                    if plan.policy_trial is None:
+                    trial_spec = plan.policy_trial
+                    if trial_spec is None:
                         return {
                             "status": "pending",
                             "decision": "undecided",
                             "reason": "host_trial_spec_not_configured",
                         }
-                    tid = "trial_" + digest(f"{eid}|{cycle}".encode())[7:39]
+                    tid = "trial_" + digest(f"{eid}|{cycle_number}".encode())[7:39]
                     record = PolicyTrialService(services).execute(
-                        policy.policy_id,
-                        proposal["policy_id"],
-                        plan.policy_trial,
+                        reference_policy.policy_id,
+                        proposal_checkpoint["policy_id"],
+                        trial_spec,
                         trial_id=tid,
                         resume=True,
                     )
@@ -591,48 +680,6 @@ class EvolutionExperimentController:
 
     def _evolution_summary(self, rows: list[EvolutionAttemptRecord]) -> dict[str, Any]:
         return {"summary_id": self.services.experience.evolution_summary(rows).summary_id}
-
-    def report(self, eid: str) -> dict[str, Any]:
-        """Read evidence and resource accounting without making model calls."""
-        directory = self.directory(eid)
-        reports = sorted(self.store.path(f"{directory}/reports").glob("*.json"))
-        stages = [
-            {
-                "stage": p.parent.name,
-                "cycle": p.parent.parent.parent.name,
-                "record_ref": p.relative_to(self.store.root).as_posix(),
-                **self.store.read(p.relative_to(self.store.root).as_posix())["result"],
-            }
-            for p in sorted(
-                self.store.path(f"{directory}/cycles").glob("*/stages/*/completed.json")
-            )
-        ]
-        return {
-            **self.status(eid),
-            "workspace": str(self.store.root),
-            "plan_ref": f"{directory}/plan.json",
-            "report_ref": reports[-1].relative_to(self.store.root).as_posix() if reports else None,
-            "reproducibility_ref": self.store.read(f"{directory}/reproducibility.json")[
-                "manifest_ref"
-            ]
-            if self.store.path(f"{directory}/reproducibility.json").exists()
-            else None,
-            "stages": stages,
-            "active_policy_id": EvolutionPolicyManager(self.store).active(),
-            "incumbent_genome_id": self.services.candidates.incumbent(),
-            "resources": self._resources(eid),
-            "limitations": [
-                "Synthetic runs establish engineering behavior only.",
-                "Unavailable independent evaluation implies unknown improvement.",
-            ],
-            "quality_improvement": "unknown"
-            if not any(
-                c.get("comparison_status") == "improved"
-                for stage in stages
-                for c in stage.get("candidates", [])
-            )
-            else "observed_in_configured_evaluation",
-        }
 
 
 class _StopExperiment(Exception):

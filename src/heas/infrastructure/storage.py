@@ -4,10 +4,19 @@ import hashlib
 import json
 import os
 import re
-from pathlib import Path, PureWindowsPath
-from typing import Any, TypeVar
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import Any, TypeVar, overload
 
-from heas.core.domain import ArtifactRef, EvidenceRef, Record, SkillRef, TaskGenome, TraceEvent, uid
+from heas.core.domain import (
+    ArtifactRef,
+    EvidenceRef,
+    Record,
+    SkillRef,
+    TaskGenome,
+    TraceEvent,
+    heas_ext,
+    uid,
+)
 from heas.core.errors import IntegrityError, MissingEvidence, SecurityError
 
 T = TypeVar("T", bound=Record)
@@ -23,6 +32,22 @@ def encode(data: Any) -> bytes:
     if isinstance(data, Record):
         data = data.model_dump(mode="json")
     return json.dumps(data, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8")
+
+
+@overload
+def redact(value: dict[str, Any]) -> dict[str, Any]: ...
+
+
+@overload
+def redact(value: list[Any]) -> list[Any]: ...
+
+
+@overload
+def redact(value: str) -> str: ...
+
+
+@overload
+def redact(value: Any) -> Any: ...
 
 
 def redact(value: Any) -> Any:
@@ -81,8 +106,10 @@ class FileStore:
 
     def path(self, uri: str) -> Path:
         """Resolve a workspace-relative path while rejecting traversal and symlink escapes."""
+        if not isinstance(uri, str) or not uri:
+            raise SecurityError("workspace-relative forward-slash path required")
         win = PureWindowsPath(uri)
-        if not uri or "\\" in uri or win.drive or win.is_absolute():
+        if "\\" in uri or win.drive or win.is_absolute():
             raise SecurityError("workspace-relative forward-slash path required")
         candidate = Path(uri)
         if candidate.is_absolute() or any(p in {"..", "."} for p in uri.split("/")):
@@ -121,6 +148,42 @@ class FileStore:
         """Load and validate persisted content without changing its inherited version."""
         return cls.model_validate(self.read(uri))
 
+    def read_object(self, uri: str) -> dict[str, Any]:
+        """Read a JSON object or reject an incompatible persisted artifact.
+
+        Use this boundary for checkpoints and reports whose contract requires an
+        object. General JSON values remain available through :meth:`read`.
+
+        Raises:
+            IntegrityError: The stored JSON is not an object.
+        """
+        value = self.read(uri)
+        if not isinstance(value, dict):
+            raise IntegrityError(f"persisted JSON object required: {uri}")
+        return value
+
+    def json_record_ref(self, uri: object, ref_type: str) -> EvidenceRef:
+        """Validate a JSON URI whose filename is its indexed evidence identity.
+
+        Args:
+            uri: Required workspace-relative URI from an archived record.
+            ref_type: Expected evidence namespace, validated by EvidenceRef.
+
+        Returns:
+            A reference using the complete filename stem, without suffix slicing.
+
+        Raises:
+            IntegrityError: The required reference is absent or is not a JSON file.
+            SecurityError: The URI escapes the workspace or uses an invalid path.
+        """
+        if not isinstance(uri, str) or not uri:
+            raise IntegrityError("required evidence URI must be a nonempty string")
+        self.path(uri)
+        filename = PurePosixPath(uri)
+        if filename.suffix != ".json" or not uri.endswith(".json"):
+            raise IntegrityError("indexed evidence URI must name a JSON record")
+        return EvidenceRef.model_validate({"ref_type": ref_type, "ref_id": filename.stem})
+
     def artifact(self, uri: str, artifact_id: str, version: str = "v1") -> ArtifactRef:
         """Create a versioned artifact and retain its content fingerprint."""
         return ArtifactRef(
@@ -150,9 +213,9 @@ class FileStore:
         offset: int | None = None,
         length: int | None = None,
     ) -> None:
-        # EvidenceRef validates IDs and type before interpolating index paths.
         """Bind a typed evidence identity to its immutable relative storage path."""
-        EvidenceRef(ref_type=ref_type, ref_id=ref_id)  # type: ignore[arg-type]
+        # Validate the dynamic type and identity before interpolating index paths.
+        EvidenceRef.model_validate({"ref_type": ref_type, "ref_id": ref_id})
         content = encode(event) if event else self.path(uri).read_bytes()
         self.put(
             f"index/{ref_type}/{ref_id}.json",
@@ -277,7 +340,7 @@ class FileStore:
             if not self.path(tool.manifest_ref).is_file():
                 raise SecurityError("tool manifest is missing")
             manifest_data = self.read(tool.manifest_ref)
-            expected = tool.extensions.get("heas", {}).get("manifest_sha256")
+            expected = heas_ext(tool).get("manifest_sha256")
             if (
                 digest(self.path(tool.manifest_ref).read_bytes()) != expected
                 or manifest_data.get("tool_id") != tool.tool_id

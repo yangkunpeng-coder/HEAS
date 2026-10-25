@@ -1,6 +1,5 @@
 """Serial paired SEABench runs with explicit HEAS capability evolution boundaries."""
 
-from collections.abc import Callable
 from typing import Any
 
 from benchmark_adapters.common.config import Partition, SEABenchConfig
@@ -10,6 +9,7 @@ from heas.agents.meta.meta import load_policy
 from heas.core.domain import Budget, EvolutionAttemptRecord, RunPlan, TaskRunRecord, now
 from heas.core.errors import HEASError, RecoveryRequired
 from heas.experimentation.isolation import IsolatedPolicyTrialRunner
+from heas.experimentation.ports import ExperimentServices, ServiceFactory
 from heas.infrastructure.model import CallBudget
 from heas.infrastructure.resources import ResourceLedger
 from heas.infrastructure.storage import digest
@@ -23,7 +23,7 @@ class SEABenchSequenceRunner:
     manifest protocol does not reproduce the official adaptive failure discovery.
     """
 
-    def __init__(self, services: Any, config: SEABenchConfig):
+    def __init__(self, services: ExperimentServices, config: SEABenchConfig):
         self.services, self.config, self.store = services, config, services.store
 
     def execute(
@@ -35,7 +35,7 @@ class SEABenchSequenceRunner:
         window_size: int = 2,
         run_budget: Budget | None = None,
         total_budget: Budget | None = None,
-        factory: Callable[[Any], Any] | None = None,
+        factory: ServiceFactory | None = None,
     ) -> dict[str, Any]:
         """Execute each manifest position once per independent arm.
 
@@ -68,7 +68,7 @@ class SEABenchSequenceRunner:
             if self.store.read(f"{directory}/request.json") != request:
                 raise HEASError("sequence request changed; use a new experiment ID")
             if self.store.path(f"{directory}/report.json").exists():
-                return self.store.read(f"{directory}/report.json")
+                return self.store.read_object(f"{directory}/report.json")
             raise RecoveryRequired("sequence interrupted; inspect sealed records before a new run")
         self.store.put(f"{directory}/request.json", request)
         isolation = IsolatedPolicyTrialRunner(self.services, directory, factory)
@@ -102,7 +102,7 @@ class SEABenchSequenceRunner:
 
     def _arm(
         self,
-        services: Any,
+        services: ExperimentServices,
         initial: str,
         policy_id: str,
         evolving: bool,
@@ -139,10 +139,12 @@ class SEABenchSequenceRunner:
                 )
                 if partition == "final_test" and frozen is None:
                     if evolving and len(attempts) >= 2:
-                        summary = services.experience.evolution_summary(attempts)
-                        summary_id = summary.summary_id
+                        evolution_summary = services.experience.evolution_summary(attempts)
+                        summary_id = evolution_summary.summary_id
                         child_policy, _ = services.meta.propose(
-                            summary, policy, {"status": "pending_independent_meta_validation"}
+                            evolution_summary,
+                            policy,
+                            {"status": "pending_independent_meta_validation"},
                         )
                         proposed_policy = child_policy.policy_id
                     frozen = {
@@ -153,6 +155,9 @@ class SEABenchSequenceRunner:
                     }
                     services.store.put("sequence/frozen.json", frozen)
                 evaluator = services.adapters.evaluators[provider.provider_id + "_evaluator"]
+                evaluator_version = getattr(evaluator, "version", None)
+                if not isinstance(evaluator_version, str) or not evaluator_version:
+                    raise HEASError("sequence evaluator requires an explicit version")
                 plan = RunPlan(
                     run_plan_id=f"sequence_{position:04d}",
                     genome_ids=[genome_id],
@@ -160,7 +165,7 @@ class SEABenchSequenceRunner:
                     task_ids=[task.task_id],
                     environment_adapter_id=environment.environment_id,
                     task_evaluator_id=evaluator.evaluator_id,
-                    evaluator_version=evaluator.version,
+                    evaluator_version=evaluator_version,
                     task_partition=partition,
                     budget=run_budget,
                     random_seed=23,
@@ -203,10 +208,13 @@ class SEABenchSequenceRunner:
                 remaining = sum(r.phase == "upstream" for r in provider.rows[position + 1 :])
                 if remaining >= window_size:
                     outcome = services.engine.step([summary], policy, compare=False)
-                    pending = outcome["attempt"]
-                    attempts.append(pending)
-                    if pending.offspring_genome_ids:
-                        genome_id = pending.offspring_genome_ids[0]
+                    attempt_record = outcome["attempt"]
+                    if not isinstance(attempt_record, EvolutionAttemptRecord):
+                        raise HEASError("sequence evolution requires an EvolutionAttemptRecord")
+                    pending = attempt_record
+                    attempts.append(attempt_record)
+                    if attempt_record.offspring_genome_ids:
+                        genome_id = attempt_record.offspring_genome_ids[0]
                 window = []
             return {
                 "runs": records,

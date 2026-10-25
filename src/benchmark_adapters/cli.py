@@ -7,6 +7,7 @@ from typing import Any
 
 from benchmark_adapters.common.config import SEABenchConfig, load_config
 from benchmark_adapters.common.preflight import preflight
+from benchmark_adapters.common.runtime import BridgedEnvironment
 from benchmark_adapters.integration import provider_for, register_config
 from benchmark_adapters.seabench.sequence import SEABenchSequenceRunner
 from benchmark_adapters.skilllearnbench.exporter import SkillExporter
@@ -16,6 +17,7 @@ from heas.agents.meta.policy_metrics import PolicyMetrics
 from heas.agents.task.tools import ToolRegistry
 from heas.core.domain import EvolutionPolicy, RunPlan, uid
 from heas.core.errors import HEASError
+from heas.experimentation.coordinator import ApplicationServices
 from heas.experimentation.experiment_controller import EvolutionExperimentController
 from heas.experimentation.experiment_plan import ExperimentPlan
 from heas.experimentation.metrics import EvolutionMetrics
@@ -193,13 +195,13 @@ def dispatch(args: argparse.Namespace) -> Any:
         raise HEASError("official execution disabled; review preflight and enable it explicitly")
     host = ApplicationConfig.model_validate_json(args.host_config.read_text(encoding="utf-8-sig"))
 
-    def factory(target: FileStore) -> Any:
-        tools, adapters = host_components(target, host)
-        if provider.provider_id not in adapters.providers:
-            register_config(target, tools, adapters, config)
-        services = build_services(target, host, tools, adapters)
-        services.isolation_factory = factory
-        return services
+    def factory(target: FileStore) -> ApplicationServices:
+        branch_tools, branch_adapters = host_components(target, host)
+        if provider.provider_id not in branch_adapters.providers:
+            register_config(target, branch_tools, branch_adapters, config)
+        branch_services = build_services(target, host, branch_tools, branch_adapters)
+        branch_services.isolation_factory = factory
+        return branch_services
 
     services = factory(store)
     try:
@@ -224,6 +226,9 @@ def dispatch(args: argparse.Namespace) -> Any:
         if not tasks:
             raise HEASError("selected partition has no tasks")
         evaluator = services.adapters.evaluators[provider.provider_id + "_evaluator"]
+        evaluator_version = getattr(evaluator, "version", None)
+        if not isinstance(evaluator_version, str) or not evaluator_version:
+            raise HEASError("official evaluator requires an explicit version")
         run_plan = RunPlan(
             run_plan_id=uid("plan"),
             genome_ids=[args.genome_id],
@@ -231,7 +236,7 @@ def dispatch(args: argparse.Namespace) -> Any:
             task_ids=[t.task_id for t in tasks],
             environment_adapter_id=provider.provider_id + "_environment",
             task_evaluator_id=evaluator.evaluator_id,
-            evaluator_version=evaluator.version,
+            evaluator_version=evaluator_version,
             task_partition=args.partition,
         )
         runs = services.runtime.batch(run_plan)
@@ -246,5 +251,5 @@ def dispatch(args: argparse.Namespace) -> Any:
         }
     finally:
         for environment in services.adapters.environments.values():
-            if hasattr(environment, "bridge"):
+            if isinstance(environment, BridgedEnvironment):
                 environment.bridge.close()

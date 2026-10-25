@@ -7,6 +7,7 @@ import subprocess
 import sys
 import threading
 from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Any
 
@@ -25,6 +26,13 @@ class BenchmarkProtocolError(HEASError):
     """Indicate an incomplete, mismatched, or invalid official bridge response."""
 
 
+@dataclass(frozen=True)
+class _ReaderFailure:
+    """Pass a pipe failure to the requesting thread without leaking worker text."""
+
+    error_type: str
+
+
 class ProcessBridge:
     """Own one serial worker connection for an application or isolated trial branch.
 
@@ -38,7 +46,7 @@ class ProcessBridge:
     def __init__(self, config: IntegrationConfig, worker_root: Path):
         self.config, self.worker_root = config, worker_root
         self.process: subprocess.Popen[str] | None = None
-        self.responses: queue.Queue[str | None] = queue.Queue(maxsize=2)
+        self.responses: queue.Queue[str | None | _ReaderFailure] = queue.Queue(maxsize=2)
         self.log: IO[str] | None = None
         self.closed = False
 
@@ -78,19 +86,26 @@ class ProcessBridge:
         )
 
         process = self.process
+        stdout = process.stdout
+        if stdout is None or process.stdin is None:
+            raise BenchmarkProtocolError("official worker requires stdin and stdout pipes")
 
         def read() -> None:
-            assert process and process.stdout
             while not self.closed:
                 # Bound allocation even when a worker omits its line terminator.
-                line = process.stdout.readline(self.max_response_chars + 1)
+                response: str | None | _ReaderFailure
+                try:
+                    line = stdout.readline(self.max_response_chars + 1)
+                    response = line or None
+                except (OSError, UnicodeError, ValueError) as exc:
+                    response = _ReaderFailure(type(exc).__name__)
                 while not self.closed:
                     try:
-                        self.responses.put(line or None, timeout=0.1)
+                        self.responses.put(response, timeout=0.1)
                         break
                     except queue.Full:
                         continue
-                if not line or len(line) > self.max_response_chars:
+                if not isinstance(response, str) or len(response) > self.max_response_chars:
                     return
 
         threading.Thread(target=read, daemon=True).start()
@@ -117,18 +132,25 @@ class ProcessBridge:
         try:
             if self.process is None:
                 self._start()
-            assert self.process and self.process.stdin
+            process = self.process
+            if process is None or process.stdin is None:
+                raise BenchmarkProtocolError("official worker has no writable request pipe")
+            stdin = process.stdin
             identity = uid("rpc")
-            self.process.stdin.write(
+            stdin.write(
                 json.dumps({"id": identity, "operation": operation, "payload": payload}) + "\n"
             )
-            self.process.stdin.flush()
+            stdin.flush()
             try:
                 line = self.responses.get(timeout=timeout)
             except queue.Empty as exc:
                 raise TimeoutError(
                     "official worker request timed out; effects were not replayed"
                 ) from exc
+            if isinstance(line, _ReaderFailure):
+                raise BenchmarkProtocolError(
+                    "official worker response pipe failed: " + line.error_type
+                )
             return self._decode_response(line, identity)
         except BaseException:
             # Even cancellation may follow a completed side effect with a lost receipt.
@@ -161,32 +183,47 @@ class ProcessBridge:
             raise BenchmarkBlocked("official worker failed: " + error_type)
         if response.get("status") != "completed":
             raise BenchmarkProtocolError("official worker response has an unknown status")
-        if not isinstance(response.get("result"), dict):
+        result = response.get("result")
+        if not isinstance(result, dict):
             raise BenchmarkProtocolError("official worker result must be an object")
-        return response["result"]
+        return result
 
     def close(self) -> None:
-        """Stop the process; retain logs and all potentially partial official artifacts."""
+        """Close owned resources without replaying requests or hiding their original failure.
+
+        Shutdown tolerates closed pipes and disappeared processes. References are
+        released before cleanup so repeated calls are safe even after an OS error.
+        Logs and potentially partial official artifacts remain available to the Host.
+        """
         self.closed = True
-        if self.process:
-            process = self.process
-            if process.poll() is None:
-                if process.stdin:
-                    with suppress(OSError, ValueError):
-                        process.stdin.close()
+        process, self.process = self.process, None
+        log, self.log = self.log, None
+        try:
+            if process is not None:
                 try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
+                    if process.stdin is not None:
+                        with suppress(OSError, ValueError):
+                            process.stdin.close()
+                    if process.poll() is None:
+                        try:
+                            process.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            with suppress(OSError):
+                                process.terminate()
+                            with suppress(OSError):
+                                process.kill()
+                            with suppress(OSError, subprocess.TimeoutExpired):
+                                process.wait(timeout=5)
+                except OSError:
+                    # The child may disappear between poll/wait/kill calls.
                     with suppress(OSError):
-                        process.terminate()
                         process.kill()
-                    with suppress(OSError, subprocess.TimeoutExpired):
-                        process.wait(timeout=5)
-            stdout = getattr(process, "stdout", None)
-            if stdout:
+                finally:
+                    stdout = getattr(process, "stdout", None)
+                    if stdout is not None:
+                        with suppress(OSError, ValueError):
+                            stdout.close()
+        finally:
+            if log is not None:
                 with suppress(OSError, ValueError):
-                    stdout.close()
-            self.process = None
-        if self.log:
-            self.log.close()
-            self.log = None
+                    log.close()

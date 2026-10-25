@@ -8,7 +8,7 @@ from heas.core.errors import HEASError
 from heas.infrastructure.storage import FileStore, digest
 
 
-class MemoryEntry(Record):
+class MemoryEntry(Record, frozen=True):
     """Represent one section of inherited textual memory with explicit provenance."""
 
     entry_id: str
@@ -117,7 +117,12 @@ class MemoryManager:
         return (
             "# Memory\n\n"
             + "\n\n".join(
-                (f"## {title}\n{body}" if title != "general" else body) for title, body in merged
+                (
+                    f"## {section_title}\n{section_body}"
+                    if section_title != "general"
+                    else section_body
+                )
+                for section_title, section_body in merged
             )
             + "\n"
         )

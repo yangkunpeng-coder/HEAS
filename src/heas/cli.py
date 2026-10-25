@@ -3,7 +3,6 @@
 import argparse
 import json
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 from heas.agents.evolution.candidates import CandidateRegistry, archived_runs
@@ -25,11 +24,15 @@ from heas.core.domain import (
     TaskExperienceSummary,
     uid,
 )
-from heas.experimentation.experiment_controller import EvolutionExperimentController
+from heas.experimentation.coordinator import ApplicationServices
+from heas.experimentation.experiment_controller import (
+    EvolutionExperimentController,
+    ExperimentControl,
+)
 from heas.experimentation.experiment_plan import ExperimentPlan
 from heas.experimentation.experiments import AttributionExperimentRunner, AttributionSpec
 from heas.experimentation.suites import EvaluationSuiteSpec, TaskSuite, run_suite
-from heas.infrastructure.application import ApplicationServices, build_services, host_components
+from heas.infrastructure.application import build_services, host_components
 from heas.infrastructure.config import ApplicationConfig
 from heas.infrastructure.reproducibility import export_manifest
 from heas.infrastructure.resources import ResourceLedger
@@ -195,9 +198,7 @@ def _dispatch_experiment(
     experiment_plan: ExperimentPlan | None,
 ) -> Any:
     """Read experiment state without model setup, or assemble services for run and resume."""
-    controller = EvolutionExperimentController(
-        SimpleNamespace(store=store, candidates=CandidateRegistry(store))
-    )
+    controller = ExperimentControl(store)
     if args.experiment_action == "resume" and controller.status(args.id)["status"] in {
         "completed",
         "cancelled",
@@ -209,9 +210,6 @@ def _dispatch_experiment(
         controller = EvolutionExperimentController(services)
         result = controller.run(experiment_plan) if experiment_plan else controller.resume(args.id)
     else:
-        controller = EvolutionExperimentController(
-            SimpleNamespace(store=store, candidates=CandidateRegistry(store))
-        )
         result = (
             getattr(controller, args.experiment_action)(args.id)
             if args.experiment_action in {"status", "report"}

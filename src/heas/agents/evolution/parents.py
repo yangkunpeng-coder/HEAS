@@ -3,7 +3,9 @@
 from typing import Any, Protocol
 
 from heas.core.domain import (
-    EvidenceRef,
+    EvidenceRef as EvidenceRef,
+)
+from heas.core.domain import (
     EvolutionPolicy,
     ParentSelectionConfig,
     TaskExperienceSummary,
@@ -81,8 +83,8 @@ class ArchiveParentSelection:
             ]
             primary = [r.evaluation.score for r in runs]
             current_protocol = comparison_protocol(store, runs)
-            comparable_score = None
-            contract = None
+            comparable_score: float | None = None
+            contract: str | None = None
             if all(m is not None for m in measurements) and all(s is not None for s in primary):
                 scores = [s for s in primary if s is not None]
                 if len({(s.source, s.name, s.unit, s.direction) for s in scores}) == 1:
@@ -90,18 +92,16 @@ class ArchiveParentSelection:
                     comparable_score = sum(s.value for s in scores) / len(scores)
                     if scores[0].direction == "lower_is_better":
                         comparable_score = -comparable_score
-            gain = None
+            gain: float | None = None
             gain_status = "not_available"
-            comparison_ref = None
+            comparison_ref: str | None = None
             try:
                 record = registry.get(genome_id)
-                comparison_ref = record.comparison_ref
-                if comparison_ref:
+                comparison_uri = record.comparison_ref
+                comparison_ref = comparison_uri
+                if comparison_uri is not None:
                     comparison = store.resolve(
-                        EvidenceRef(
-                            ref_type="candidate_comparison",
-                            ref_id=comparison_ref.rsplit("/", 1)[-1][:-5],
-                        )
+                        store.json_record_ref(comparison_uri, "candidate_comparison")
                     )
                     previous_runs = archived_runs(store, comparison["new_run_ids"])
                     if comparison_protocol(store, previous_runs) == current_protocol:
@@ -131,44 +131,49 @@ class ArchiveParentSelection:
         count = config.max_parents if policy.parent_selection else min(8, len(candidates))
         while candidates and len(selected) < count:
 
-            def rank(row: dict[str, Any]) -> float:
+            def rank(parent_candidate: dict[str, Any]) -> float:
                 peers = [
                     r
                     for r in candidates
-                    if r["contract"] == row["contract"] and r["score"] is not None
+                    if r["contract"] == parent_candidate["contract"] and r["score"] is not None
                 ]
                 # Rank only within compatible metric protocols; never mix raw score scales.
                 percentile = (
-                    sum(p["score"] < row["score"] for p in peers) / max(1, len(peers) - 1)
-                    if row["score"] is not None
+                    sum(p["score"] < parent_candidate["score"] for p in peers)
+                    / max(1, len(peers) - 1)
+                    if parent_candidate["score"] is not None
                     else 0
                 )
-                novelty = len(row["features"] - selected_features) / max(1, len(row["features"]))
+                novelty = len(parent_candidate["features"] - selected_features) / max(
+                    1, len(parent_candidate["features"])
+                )
                 return (
                     config.performance_weight * percentile
                     + config.diversity_weight * novelty
                     + config.historical_gain_weight
-                    * int(row["gain"] is not None and row["gain"] > 0)
-                    + config.exploration_weight * int(row["score"] is None)
+                    * int(parent_candidate["gain"] is not None and parent_candidate["gain"] > 0)
+                    + config.exploration_weight * int(parent_candidate["score"] is None)
                 )
 
-            row = max(candidates, key=rank)
+            selected_candidate = max(candidates, key=rank)
             ranking.append(
                 {
-                    "genome_id": row["summary"].genome_id,
-                    "selection_utility": rank(row),
-                    "objective_score_available": row["score"] is not None,
-                    "historical_gain": row["gain"],
-                    "historical_gain_status": row["gain_status"],
-                    "comparison_ref": row["comparison_ref"],
+                    "genome_id": selected_candidate["summary"].genome_id,
+                    "selection_utility": rank(selected_candidate),
+                    "objective_score_available": selected_candidate["score"] is not None,
+                    "historical_gain": selected_candidate["gain"],
+                    "historical_gain_status": selected_candidate["gain_status"],
+                    "comparison_ref": selected_candidate["comparison_ref"],
                     "reason": "Compatible performance rank, capability novelty, historical "
                     "comparison evidence and exploration; utility is not objective fitness.",
-                    "evidence_refs": [{"ref_type": "summary", "ref_id": row["summary"].summary_id}],
+                    "evidence_refs": [
+                        {"ref_type": "summary", "ref_id": selected_candidate["summary"].summary_id}
+                    ],
                 }
             )
-            selected.append(row["summary"])
-            selected_features.update(row["features"])
-            candidates.remove(row)
+            selected.append(selected_candidate["summary"])
+            selected_features.update(selected_candidate["features"])
+            candidates.remove(selected_candidate)
         return selected, {
             "selector_version": self.version,
             "policy_id": policy.policy_id,

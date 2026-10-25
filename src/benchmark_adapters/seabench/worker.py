@@ -10,8 +10,8 @@ from typing import Any
 
 from benchmark_adapters.common.config import SEABenchConfig
 from benchmark_adapters.common.process import BenchmarkBlocked
-from benchmark_adapters.common.protocol import OfficialReceipt
-from heas.core.errors import SecurityError
+from benchmark_adapters.common.protocol import OfficialReceipt, required_text
+from heas.core.errors import HEASError, SecurityError
 from heas.infrastructure.storage import digest, encode
 
 
@@ -73,11 +73,19 @@ class SEABenchWorker:
 
     def handle(self, operation: str, payload: dict[str, Any]) -> dict[str, Any]:
         """Run public actions or private official evaluation for one correlated session."""
-        session = str(payload["session_id"])
+        session = required_text(payload, "session_id")
         if operation == "prepare":
-            task = self.tasks[str(payload["official_task_id"])]
-            sequence = payload.get("sequence") or {}
-            sequence_id = str(sequence.get("session_id", session))
+            task = self.tasks[required_text(payload, "official_task_id")]
+            sequence = payload.get("sequence")
+            if sequence is None:
+                sequence = {}
+            if not isinstance(sequence, dict):
+                raise HEASError("sequence context must be an object when supplied")
+            sequence_id = (
+                session
+                if sequence.get("session_id") is None
+                else required_text(sequence, "session_id")
+            )
             identity = digest(sequence_id.encode())[7:39]
             if identity not in self.sequences:
                 workspace = self.root / "public" / identity
@@ -124,7 +132,7 @@ class SEABenchWorker:
             },
         )
         passed, feedback, backend, observer, detail = self.validator.evaluate_task_answer(
-            task, str(payload["answer"]), workspace
+            task, required_text(payload, "answer", allow_empty=True), workspace
         )
         raw = {
             "passed": passed,

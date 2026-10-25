@@ -11,7 +11,7 @@ from heas.core.errors import BudgetExceeded, HEASError
 from heas.infrastructure.model import CallBudget, ModelGateway
 
 
-class ContextLimits(Record):
+class ContextLimits(Record, frozen=True):
     """Bound skill and memory material loaded into a task's public context."""
 
     max_skills: int = Field(default=2, ge=0)
@@ -21,14 +21,14 @@ class ContextLimits(Record):
     max_tools: int = Field(default=8, ge=0)
 
 
-class SelectionChoice(Record):
+class SelectionChoice(Record, frozen=True):
     """Attach a bounded selection rationale to an artifact identity."""
 
     artifact_id: str
     reason: str
 
 
-class SkillSelection(Record):
+class SkillSelection(Record, frozen=True):
     """Return selected skills and their host-verifiable selection evidence."""
 
     choices: list[SelectionChoice]
@@ -79,9 +79,12 @@ class RuleSkillSelector:
             choices=[
                 SelectionChoice(
                     artifact_id=s.artifact_id,
-                    reason=f"rule overlap={-score}; applicability={s.applicability or 'general'}",
+                    reason=(
+                        f"rule overlap={-negative_overlap}; "
+                        f"applicability={s.applicability or 'general'}"
+                    ),
                 )
-                for score, _, s in sorted(ranked)[: limits.max_skills]
+                for negative_overlap, _, s in sorted(ranked)[: limits.max_skills]
             ]
         )
 
@@ -165,7 +168,9 @@ class RuleToolSelector:
     ) -> list[ToolBinding]:
         """Select admissible capabilities or parents and retain the reasons for the choice."""
         available = {t.tool_id: t for t in tools}
-        required = {tool_id for skill in skills for tool_id in skill.requires_tools}
+        required = {
+            dependency_tool_id for skill in skills for dependency_tool_id in skill.requires_tools
+        }
         tokens = words(task.instruction + " " + str(state))
         selected = set(required)
         for binding in tools:
@@ -175,17 +180,19 @@ class RuleToolSelector:
                 if len(selected) < limits.max_tools:
                     selected.add(binding.tool_id)
 
-        def include(tool_id: str, visiting: set[str]) -> None:
-            if tool_id in visiting:
+        def include(required_tool_id: str, visiting: set[str]) -> None:
+            if required_tool_id in visiting:
                 raise HEASError("cyclic tool dependency")
-            if tool_id not in available:
+            if required_tool_id not in available:
                 raise HEASError("selected capability has unavailable tool dependency")
-            binding = available[tool_id]
-            registry.validate(binding)
-            manifest = registry.entries[(binding.tool_id, binding.version_id)][0]
-            for dependency in manifest.requires_tools:
+            required_binding = available[required_tool_id]
+            registry.validate(required_binding)
+            required_manifest = registry.entries[
+                (required_binding.tool_id, required_binding.version_id)
+            ][0]
+            for dependency in required_manifest.requires_tools:
                 selected.add(dependency)
-                include(dependency, visiting | {tool_id})
+                include(dependency, visiting | {required_tool_id})
 
         for tool_id in list(selected):
             include(tool_id, set())

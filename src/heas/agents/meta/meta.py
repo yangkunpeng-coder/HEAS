@@ -1,6 +1,6 @@
 """L3 policy proposals, immutable versions and conservative matched-trial states."""
 
-from typing import Any
+from typing import Any, Literal
 
 from heas.core.domain import (
     Budget,
@@ -35,7 +35,7 @@ POLICY_FIELDS = frozenset(
 )
 
 
-class PolicyAnalysis(Record):
+class PolicyAnalysis(Record, frozen=True):
     """Validate a model's admissible policy edits and supporting hypotheses."""
 
     change_set: dict[str, Any]
@@ -175,9 +175,11 @@ class MetaEvolutionService:
             meter,
         )
 
-        def validate_analysis(analysis: PolicyAnalysis) -> None:
-            edit_policy(parent, analysis.change_set)
-            validate_evidence(self.store, analysis, {(r.ref_type, r.ref_id) for r in refs})
+        def validate_analysis(candidate_analysis: PolicyAnalysis) -> None:
+            edit_policy(parent, candidate_analysis.change_set)
+            validate_evidence(
+                self.store, candidate_analysis, {(r.ref_type, r.ref_id) for r in refs}
+            )
 
         analysis = self.gateway.structured(
             "meta_policy",
@@ -226,7 +228,7 @@ class MetaEvolutionService:
     ) -> MetaPolicyTrial:
         """Persist supplied trial evidence without granting unearned policy activation."""
         matched = matching_settings(old_plan, new_plan, old_starts, new_starts)
-        status: Any = (
+        status: Literal["invalid", "pending", "not_available"] = (
             "invalid"
             if not matched
             else ("pending" if old_plan.task_evaluator_id else "not_available")

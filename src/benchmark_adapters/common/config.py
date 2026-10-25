@@ -18,7 +18,7 @@ Partition = Literal[
 ]
 
 
-class BenchmarkConfig(Record):
+class BenchmarkConfig(Record, frozen=True):
     """Declare trusted source locations and explicit execution boundaries.
 
     Paths are host configuration, never fields chosen by a Task Agent. Execution
@@ -45,7 +45,7 @@ class BenchmarkConfig(Record):
         return self
 
 
-class EvoAgentBenchConfig(BenchmarkConfig):
+class EvoAgentBenchConfig(BenchmarkConfig, frozen=True):
     """Configure one of the four official EvoAgentBench domain adapters."""
 
     benchmark: Literal["evoagentbench"] = "evoagentbench"
@@ -57,7 +57,7 @@ class EvoAgentBenchConfig(BenchmarkConfig):
     mcp_tool_allowlist: list[str] = Field(default_factory=lambda: ["search", "fetch"])
 
 
-class SEABenchConfig(BenchmarkConfig):
+class SEABenchConfig(BenchmarkConfig, frozen=True):
     """Configure an ordered upstream/frozen-downstream SEABench sequence."""
 
     benchmark: Literal["seabench"] = "seabench"
@@ -68,7 +68,7 @@ class SEABenchConfig(BenchmarkConfig):
     judge_key_env: str = "OPENROUTER_API_KEY"
 
 
-class SkillLearnBenchConfig(BenchmarkConfig):
+class SkillLearnBenchConfig(BenchmarkConfig, frozen=True):
     """Configure exported-genome-skill evaluation by the official solving agent."""
 
     benchmark: Literal["skilllearnbench"] = "skilllearnbench"

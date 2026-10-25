@@ -1,15 +1,15 @@
 """Independent host services and immutable trial snapshots; no domain or test dependencies."""
 
 import copy
-from collections.abc import Callable
+from collections.abc import Callable as Callable
 from typing import Any
 
 from heas.agents.task.selectors import LLMSkillSelector
 from heas.agents.task.tools import ToolRegistry
 from heas.core.errors import HEASError, IntegrityError
+from heas.experimentation.ports import ExperimentServices
+from heas.experimentation.ports import ServiceFactory as ServiceFactory
 from heas.infrastructure.storage import FileStore, digest
-
-ServiceFactory = Callable[[FileStore], Any]
 
 
 def independent(value: Any) -> Any:
@@ -36,7 +36,7 @@ def independent(value: Any) -> Any:
 class ServiceBlueprint:
     """Freeze source state once, before either side is run, then clone per repetition."""
 
-    def __init__(self, services: Any):
+    def __init__(self, services: ExperimentServices):
         self.model = independent(services.gateway.model)
         self.models = {p: independent(m) for p, m in services.gateway.models_by_purpose.items()}
         self.adapters = independent(services.adapters)
@@ -60,7 +60,7 @@ class ServiceBlueprint:
         )
         self.selector = None if self.selector_inventory else independent(selector)
 
-    def create(self, store: FileStore) -> Any:
+    def create(self, store: FileStore) -> ExperimentServices:
         """Initialize the immutable host configuration or an independent execution branch."""
         from heas.experimentation.coordinator import ApplicationServices
 
@@ -110,7 +110,9 @@ def copy_files(source: FileStore, target: FileStore, directories: tuple[str, ...
 class IsolatedPolicyTrialRunner:
     """Create matched snapshots and collect evidence without importing activations."""
 
-    def __init__(self, services: Any, directory: str, factory: ServiceFactory | None = None):
+    def __init__(
+        self, services: ExperimentServices, directory: str, factory: ServiceFactory | None = None
+    ):
         self.source = services
         self.store = services.store
         self.directory = directory
@@ -134,7 +136,7 @@ class IsolatedPolicyTrialRunner:
         self.store.put(f"{directory}/snapshot_manifest.json", {"files": self.snapshot_files})
         self.instances: list[Any] = []
 
-    def create(self, side: str, repetition: int, seed: int) -> Any:
+    def create(self, side: str, repetition: int, seed: int) -> ExperimentServices:
         """Initialize the immutable host configuration or an independent execution branch."""
         branch = FileStore(
             self.store.path(f"{self.directory}/branches/{side}/r{repetition}_s{seed}")
@@ -179,7 +181,7 @@ class IsolatedPolicyTrialRunner:
         child.experience.archive_scope = "policy_trial"
         return child
 
-    def collect(self, services: Any) -> None:
+    def collect(self, services: ExperimentServices) -> None:
         # Candidate revisions / activations intentionally stay inside the branch.
         """Import immutable branch evidence while keeping candidate activations isolated."""
         copy_files(

@@ -24,12 +24,24 @@ def read_sequence(config: SEABenchConfig) -> tuple[dict[str, Any], list[PublicTa
     tasks = raw.get("tasks")
     if not isinstance(tasks, list) or not tasks:
         raise HEASError("official sequence has no task list")
+    generation = raw.get("generation")
+    if generation is None:
+        generation = {}
+    if not isinstance(generation, dict):
+        raise HEASError("sequence generation metadata must be an object when supplied")
+    raw_sequence_id = raw.get("id")
+    sequence_id = "" if raw_sequence_id is None else str(raw_sequence_id)
+    surface = generation.get("surface")
+    domain = "" if surface is None else str(surface)
     rows = []
     downstream = False
     for position, task in enumerate(tasks):
         if not isinstance(task, dict) or not task.get("id") or not task.get("prompt"):
             raise HEASError("official sequence task is missing id or prompt")
-        phase = task.get("optimization", {}).get("role")
+        optimization = task.get("optimization")
+        if not isinstance(optimization, dict):
+            raise HEASError("SEABench task requires an optimization object")
+        phase = optimization.get("role")
         if phase not in {"upstream", "downstream"}:
             raise HEASError("SEABench task requires an explicit upstream/downstream role")
         if downstream and phase == "upstream":
@@ -45,8 +57,8 @@ def read_sequence(config: SEABenchConfig) -> tuple[dict[str, Any], list[PublicTa
                 phase=phase,
                 position=position,
                 source_sha256=digest(config.sequence_file.read_bytes()),
-                sequence_id=str(raw.get("id", "")),
-                domain=str(raw.get("generation", {}).get("surface", "")),
+                sequence_id=sequence_id,
+                domain=domain,
             )
         )
     if not downstream or not any(row.phase == "upstream" for row in rows):
@@ -66,7 +78,7 @@ class SEABenchProvider(CatalogProvider):
             if not set(identities).issubset(downstream if partition == "final_test" else upstream):
                 raise SecurityError("downstream SEABench tasks are reserved for frozen reporting")
         super().__init__(
-            "seabench_" + digest(str(rows[0].sequence_id).encode())[7:19],
+            "seabench_" + digest((rows[0].sequence_id or "").encode())[7:19],
             rows,
             config.revision,
             config.data_origin,

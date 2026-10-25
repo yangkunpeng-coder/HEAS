@@ -16,10 +16,11 @@ from heas.core.domain import (
     Score,
     TaskGenome,
     TaskRunRecord,
+    heas_ext,
     now,
     uid,
 )
-from heas.core.errors import HEASError, SecurityError
+from heas.core.errors import HEASError, IntegrityError, SecurityError
 from heas.infrastructure.storage import FileStore, digest, encode
 
 if TYPE_CHECKING:
@@ -27,7 +28,7 @@ if TYPE_CHECKING:
     from heas.core.domain import EvolutionPolicy
 
 
-class CandidateRecord(Record):
+class CandidateRecord(Record, frozen=True):
     """Archive one immutable revision of a candidate's execution and comparison state."""
 
     schema_version: Literal["1.1"] = "1.1"
@@ -67,14 +68,15 @@ def external_score(store: FileStore, runs: list[TaskRunRecord]) -> Score | None:
         result = EvaluationResult.model_validate(
             store.resolve(EvidenceRef(ref_type="feedback", ref_id=run.run_id))
         )
+        score = result.score
         if (
             result.run_id != run.run_id
-            or result.score is None
-            or result.score != run.evaluation.score
+            or score is None
+            or score != run.evaluation.score
             or result.evaluation_status != "completed"
         ):
             return None
-        scores.append(result.score)
+        scores.append(score)
     if not scores:
         return None
     if len({(s.name, s.unit, s.direction, s.source) for s in scores}) != 1:
@@ -101,8 +103,9 @@ def evaluated_metrics(
     ):
         return None
     metrics = {f"{s.source}:{s.name}": s for s in feedback.scores}
-    if feedback.score:
-        metrics[f"{feedback.score.source}:{feedback.score.name}"] = feedback.score
+    primary_score = feedback.score
+    if primary_score is not None:
+        metrics[f"{primary_score.source}:{primary_score.name}"] = primary_score
     if not metrics:
         return None
     versions = {
@@ -142,14 +145,10 @@ def comparison_protocol(store: FileStore, runs: list[TaskRunRecord]) -> str:
                 "task_id": run.task_id,
                 "attempt": run.attempt_index,
                 "task_instance_sha256": run.task_instance_sha256,
-                "environment_input_sha256": run.extensions.get("heas", {}).get(
-                    "environment_input_sha256"
-                ),
+                "environment_input_sha256": heas_ext(run).get("environment_input_sha256"),
                 "plan": {key: plan.model_dump(mode="json")[key] for key in fields},
-                "model_identity": run.extensions.get("heas", {}).get("model_identity"),
-                "model_parameters_sha256": run.extensions.get("heas", {}).get(
-                    "model_parameters_sha256"
-                ),
+                "model_identity": heas_ext(run).get("model_identity"),
+                "model_parameters_sha256": heas_ext(run).get("model_parameters_sha256"),
                 "metrics": {
                     key: score.model_dump(exclude={"value"}) for key, score in measured[0].items()
                 }
@@ -192,8 +191,8 @@ def compare_windows(
             raise HEASError("comparison window does not cover the complete configured task set")
         identities = {
             (
-                r.extensions.get("heas", {}).get("model_identity", ""),
-                r.extensions.get("heas", {}).get("model_parameters_sha256", ""),
+                heas_ext(r).get("model_identity", ""),
+                heas_ext(r).get("model_parameters_sha256", ""),
             )
             for r in runs
         }
@@ -224,8 +223,7 @@ def compare_windows(
     if any(a.task_instance_sha256 != b.task_instance_sha256 for a, b in zip(old, new, strict=True)):
         return {**base, "comparison_status": "not_comparable", "reason": "task_instance_mismatch"}
     if any(
-        a.extensions.get("heas", {}).get("environment_input_sha256")
-        != b.extensions.get("heas", {}).get("environment_input_sha256")
+        heas_ext(a).get("environment_input_sha256") != heas_ext(b).get("environment_input_sha256")
         for a, b in zip(old, new, strict=True)
     ):
         return {
@@ -244,7 +242,10 @@ def compare_windows(
         ):
             return {**base, "comparison_status": "not_comparable", "reason": "infrastructure_error"}
     contracts = [
-        {key: (s.model_dump(exclude={"value"}), versions[key]) for key, s in metrics.items()}
+        {
+            metric_key: (s.model_dump(exclude={"value"}), versions[metric_key])
+            for metric_key, s in metrics.items()
+        }
         for metrics, versions, _ in complete
     ]
     if any(c != contracts[0] for c in contracts):
@@ -257,9 +258,9 @@ def compare_windows(
         after = sum(m[0][key].value for m in new_metrics) / len(new)
         sign = 1 if complete[0][0][key].direction == "higher_is_better" else -1
         changes[key] = {"old": before, "new": after, "improvement": sign * (after - before)}
+    primary_scores = [evaluated_run.evaluation.score for evaluated_run in old + new]
     primary_keys = {
-        f"{r.evaluation.score.source}:{r.evaluation.score.name}" if r.evaluation.score else None
-        for r in old + new
+        f"{score.source}:{score.name}" if score is not None else None for score in primary_scores
     }
     if len(primary_keys) != 1:
         return {**base, "comparison_status": "not_comparable", "reason": "primary_metric_mismatch"}
@@ -483,11 +484,13 @@ class CandidateRegistry:
     def incumbent(self) -> str | None:
         """Read the latest explicitly activated candidate identity."""
         paths = sorted(self.store.path("candidates/activations").glob("*.json"))
-        return (
-            self.store.read(paths[-1].relative_to(self.store.root).as_posix())["genome_id"]
-            if paths
-            else None
-        )
+        if not paths:
+            return None
+        activation = self.store.read_object(paths[-1].relative_to(self.store.root).as_posix())
+        genome_id = activation.get("genome_id")
+        if not isinstance(genome_id, str) or not genome_id:
+            raise IntegrityError("candidate activation requires a nonempty genome identity")
+        return EvidenceRef(ref_type="artifact", ref_id=genome_id).ref_id
 
     def list_candidates(self, *, evaluated: bool | None = None) -> list[CandidateRecord]:
         """Load the latest immutable revision of each archived candidate."""
@@ -535,9 +538,7 @@ class CandidateRegistry:
                 self.store.load(p.relative_to(self.store.root).as_posix(), TaskExperienceSummary)
                 for p in directory.glob("*.json")
             ]
-            summaries = [
-                s for s in summaries if s.extensions.get("heas", {}).get("scope") != "policy_trial"
-            ]
+            summaries = [s for s in summaries if heas_ext(s).get("scope") != "policy_trial"]
             if summaries:
                 pool.append(max(summaries, key=lambda summary: summary.created_at))
         if policy and selector and pool:
@@ -564,17 +565,22 @@ class CandidateRegistry:
         not by itself qualify the child for promotion.
         """
         current = self.get(genome_id)
-        reference_id = reference_id or self.incumbent()
-        if not reference_id or reference_id == genome_id:
+        selected_reference = reference_id or self.incumbent()
+        if not selected_reference or selected_reference == genome_id:
             raise HEASError("comparison requires a distinct archived reference candidate")
-        reference = self.get(reference_id)
+        reference = self.get(selected_reference)
         comparison = compare_windows(self.store, reference.run_ids, current.run_ids)
-        uri = f"candidates/comparisons/{uid('comparison')}.json"
+        comparison_id = uid("comparison")
+        uri = f"candidates/comparisons/{comparison_id}.json"
         self.store.put(
             uri,
-            {**comparison, "reference_genome_id": reference_id, "candidate_genome_id": genome_id},
+            {
+                **comparison,
+                "reference_genome_id": selected_reference,
+                "candidate_genome_id": genome_id,
+            },
         )
-        self.store.index("candidate_comparison", uri.rsplit("/", 1)[-1][:-5], uri)
+        self.store.index("candidate_comparison", comparison_id, uri)
         return self.save(
             CandidateRecord.model_validate(
                 {
@@ -596,9 +602,11 @@ class CandidateRegistry:
         and policy guidance cannot override eligibility or supply missing scores.
         """
         current = self.get(genome_id)
-        if current.promotion_status != "eligible" or not current.comparison_ref:
+        comparison_uri = current.comparison_ref
+        if current.promotion_status != "eligible" or not comparison_uri:
             raise HEASError("candidate lacks independently confirmed improvement")
-        comparison = self.store.read(current.comparison_ref)
+        self.store.json_record_ref(comparison_uri, "candidate_comparison")
+        comparison = self.store.read_object(comparison_uri)
         if comparison["reference_genome_id"] != self.incumbent():
             raise HEASError("comparison reference is no longer incumbent")
         fresh = compare_windows(self.store, comparison["old_run_ids"], comparison["new_run_ids"])
@@ -611,7 +619,7 @@ class CandidateRegistry:
                 "schema_version": "1.1",
                 "genome_id": genome_id,
                 "reason": "objective_comparison",
-                "comparison_ref": current.comparison_ref,
+                "comparison_ref": comparison_uri,
                 "created_at": now().isoformat(),
             },
         )

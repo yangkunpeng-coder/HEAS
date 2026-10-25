@@ -8,7 +8,7 @@ from typing import Any
 
 from benchmark_adapters.common.config import SkillLearnBenchConfig
 from benchmark_adapters.common.process import BenchmarkBlocked
-from benchmark_adapters.common.protocol import OfficialReceipt
+from benchmark_adapters.common.protocol import OfficialReceipt, required_text
 from benchmark_adapters.skilllearnbench.exporter import export_capabilities
 from benchmark_adapters.skilllearnbench.results import COUNT_COLUMNS, quality_metrics, trial_metrics
 from heas.core.errors import SecurityError
@@ -57,9 +57,9 @@ class SkillLearnBenchWorker:
 
     def handle(self, operation: str, payload: dict[str, Any]) -> dict[str, Any]:
         """Prepare evaluation requests or run the official bounded serial command."""
-        session = str(payload["session_id"])
+        session = required_text(payload, "session_id")
         if operation == "prepare":
-            self.sessions[session] = str(payload["official_task_id"])
+            self.sessions[session] = required_text(payload, "official_task_id")
             return {
                 "official_prompt": "Review the public task instruction. Independent evaluation "
                 "uses the genome's exported skills with the official solving agent.",

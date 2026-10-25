@@ -8,6 +8,16 @@ from heas.core.errors import HEASError
 from heas.core.ports import StructuredTaskEvaluator, TaskEnvironment, TaskEvaluator, TaskProvider
 
 
+def _check_adapter(adapter: object, identity_field: str, methods: tuple[str, ...]) -> str:
+    """Validate dynamic plugin objects before publishing them through typed ports."""
+    identifier: object = getattr(adapter, identity_field, None)
+    if not isinstance(identifier, str) or not identifier:
+        raise HEASError(f"adapter requires a nonempty {identity_field}")
+    if any(not callable(getattr(adapter, method, None)) for method in methods):
+        raise HEASError(f"adapter {identifier} requires callable methods: {', '.join(methods)}")
+    return identifier
+
+
 class AdapterRegistry:
     """Register host-supplied task ports without introducing benchmark logic into Core."""
 
@@ -18,21 +28,29 @@ class AdapterRegistry:
 
     def register_provider(self, adapter: TaskProvider) -> None:
         """Register a task provider with a unique host-owned identifier."""
-        if adapter.provider_id in self.providers:
+        identifier = _check_adapter(adapter, "provider_id", ("list_tasks", "get_task"))
+        if identifier in self.providers:
             raise HEASError("duplicate provider")
-        self.providers[adapter.provider_id] = adapter
+        self.providers[identifier] = adapter
 
     def register_environment(self, adapter: TaskEnvironment) -> None:
         """Register an environment without replacing an existing binding."""
-        if adapter.environment_id in self.environments:
+        identifier = _check_adapter(
+            adapter, "environment_id", ("prepare", "observe", "apply_tool", "teardown")
+        )
+        if identifier in self.environments:
             raise HEASError("duplicate environment")
-        self.environments[adapter.environment_id] = adapter
+        self.environments[identifier] = adapter
 
     def register_evaluator(self, adapter: TaskEvaluator | StructuredTaskEvaluator) -> None:
         """Register an independent evaluator with a unique host-owned identifier."""
-        if adapter.evaluator_id in self.evaluators:
+        identifier = _check_adapter(adapter, "evaluator_id", ())
+        # Structured output keeps priority when an adapter implements both ports.
+        method = "evaluate_result" if hasattr(adapter, "evaluate_result") else "evaluate"
+        _check_adapter(adapter, "evaluator_id", (method,))
+        if identifier in self.evaluators:
             raise HEASError("duplicate evaluator")
-        self.evaluators[adapter.evaluator_id] = adapter
+        self.evaluators[identifier] = adapter
 
 
 class FileTaskProvider:

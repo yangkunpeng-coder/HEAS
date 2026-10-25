@@ -15,17 +15,24 @@ def load_official_splits(config: EvoAgentBenchConfig) -> dict[str, list[str]]:
     if not path.is_file():
         raise HEASError(f"official task-ID split is missing: {path}")
     raw = json.loads(path.read_text(encoding="utf-8-sig"))
-    if set(raw) != {"train", "test"} or any(not isinstance(v, list) for v in raw.values()):
+    if not isinstance(raw, dict) or set(raw) != {"train", "test"}:
         raise HEASError("unsupported official split format; expected train/test ID arrays")
-    if any(
-        not isinstance(identity, str) or not identity for ids in raw.values() for identity in ids
-    ):
-        raise HEASError("official task IDs must be nonempty strings")
-    if any(len(ids) != len(set(ids)) for ids in raw.values()) or set(raw["train"]) & set(
-        raw["test"]
+    splits: dict[str, list[str]] = {}
+    for split in ("train", "test"):
+        identities = raw[split]
+        if not isinstance(identities, list):
+            raise HEASError("unsupported official split format; expected train/test ID arrays")
+        validated: list[str] = []
+        for identity in identities:
+            if not isinstance(identity, str) or not identity:
+                raise HEASError("official task IDs must be nonempty strings")
+            validated.append(identity)
+        splits[split] = validated
+    if any(len(ids) != len(set(ids)) for ids in splits.values()) or set(splits["train"]) & set(
+        splits["test"]
     ):
         raise SecurityError("official split contains duplicate or overlapping task IDs")
-    return raw
+    return splits
 
 
 class EvoAgentBenchProvider(CatalogProvider):
@@ -48,8 +55,8 @@ class EvoAgentBenchProvider(CatalogProvider):
                 domain=config.domain,
                 prompt="Execute the official request in environment observation.official_prompt.",
             )
-            for split, identities in splits.items()
-            for identity in identities
+            for split, split_task_ids in splits.items()
+            for identity in split_task_ids
         ]
         super().__init__(
             "evoagentbench_" + config.domain,

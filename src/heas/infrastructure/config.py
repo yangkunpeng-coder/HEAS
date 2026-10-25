@@ -9,7 +9,7 @@ from heas.core.domain import Budget, Record
 from heas.evidence.aggregation import AggregationConfig
 
 
-class ModelProfile(Record):
+class ModelProfile(Record, frozen=True):
     """Configure a host-selected provider without inheriting model settings in a Genome."""
 
     model: str = Field(min_length=1)
@@ -21,7 +21,7 @@ class ModelProfile(Record):
     request_parameters: dict[str, Any] = Field(default_factory=dict)
 
 
-class ApplicationConfig(Record):
+class ApplicationConfig(Record, frozen=True):
     """Bind trusted ports, role models, context limits, and shared resource budgets."""
 
     workspace: str

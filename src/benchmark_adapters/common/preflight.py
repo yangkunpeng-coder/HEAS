@@ -21,8 +21,8 @@ def preflight(config: IntegrationConfig) -> dict[str, Any]:
     """Report pinned-source, configuration, dependency, and execution readiness."""
     checks: list[dict[str, Any]] = []
 
-    def check(name: str, ready: bool, detail: str) -> None:
-        checks.append({"name": name, "ready": ready, "detail": detail})
+    def check(check_name: str, ready: bool, detail: str) -> None:
+        checks.append({"name": check_name, "ready": ready, "detail": detail})
 
     root = source_root(config)
     check("repository", root.is_dir(), str(root))

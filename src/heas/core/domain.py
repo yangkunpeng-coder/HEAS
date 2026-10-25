@@ -32,7 +32,7 @@ def uid(prefix: str) -> str:
     return f"{prefix}_{uuid4().hex}"
 
 
-class Record(BaseModel):
+class Record(BaseModel, frozen=True):
     """Base contract for versioned, immutable records with explicit extensions."""
 
     @staticmethod
@@ -56,7 +56,7 @@ class Record(BaseModel):
         return value
 
 
-class ArtifactRef(Record):
+class ArtifactRef(Record, frozen=True):
     """Identify one immutable, versioned capability artifact by URI and content hash.
 
     The store verifies the referenced bytes before an agent can load them. A new
@@ -69,7 +69,7 @@ class ArtifactRef(Record):
     uri: str
 
 
-class SkillRef(ArtifactRef):
+class SkillRef(ArtifactRef, frozen=True):
     """Reference a Skill and its applicability, dependencies and conflict constraints.
 
     Selectors may use these declarations to choose context. Selection records show
@@ -88,13 +88,20 @@ class SkillRef(ArtifactRef):
         """Normalize the legacy manifest reference for backward-compatible loading."""
         if isinstance(value, dict):
             value = dict(value)
-            legacy = value.get("extensions", {}).get("heas", {})
+            extensions = value.get("extensions", {})
+            if not isinstance(extensions, dict):
+                return value  # Normal field validation reports the invalid root object.
+            legacy = extensions.get("heas")
+            if legacy is None:
+                legacy = {}
+            if not isinstance(legacy, dict):
+                raise ValueError("HEAS extension metadata must be an object when supplied")
             value.setdefault("requires_tools", legacy.get("requires_tools", []))
             value.setdefault("selection_tags", legacy.get("selection_tags", []))
         return value
 
 
-class EvidenceRef(Record):
+class EvidenceRef(Record, frozen=True):
     """Point to a registered trace event, run, summary or evolution artifact.
 
     Evidence resolution checks existence and scope; a reference by itself does not
@@ -117,7 +124,7 @@ class EvidenceRef(Record):
     ref_id: Id
 
 
-class Claim(Record):
+class Claim(Record, frozen=True):
     """State an observation or hypothesis with evidence and explicit uncertainty.
 
     Observed claims require references. External verification additionally requires
@@ -142,7 +149,7 @@ class Claim(Record):
         return self
 
 
-class ModelPricing(Record):
+class ModelPricing(Record, frozen=True):
     """Freeze the Host's versioned token prices and their stated source.
 
     These prices support cost accounting; they are not live provider quotations.
@@ -155,7 +162,7 @@ class ModelPricing(Record):
     version: str = Field(min_length=1)
 
 
-class Budget(Record):
+class Budget(Record, frozen=True):
     """Declare Host limits on calls, loop steps, elapsed time, tokens and cost.
 
     Optional monetary limits require a pricing contract. Policies can guide edit
@@ -179,7 +186,7 @@ class Budget(Record):
         return self
 
 
-class Usage(Record):
+class Usage(Record, frozen=True):
     """Record consumed resources and whether reported token usage is available.
 
     Missing provider usage remains explicitly unknown; zero counters must not be
@@ -195,7 +202,7 @@ class Usage(Record):
     monetary_cost: float | None = Field(default=None, ge=0)
 
 
-class Score(Record):
+class Score(Record, frozen=True):
     """Represent an externally supplied metric with direction, unit and source.
 
     Comparisons require compatible evaluation contracts. HEAS does not normalize
@@ -209,7 +216,7 @@ class Score(Record):
     source: str
 
 
-class EvaluationState(Record):
+class EvaluationState(Record, frozen=True):
     """Separate evaluation availability from the outcome of task execution.
 
     Only completed evaluation can carry scores. Failed or invalid infrastructure
@@ -236,7 +243,7 @@ class EvaluationState(Record):
         return self
 
 
-class EvaluationResult(EvaluationState):
+class EvaluationResult(EvaluationState, frozen=True):
     """Bind an independent evaluator's receipt to a run and evaluator version.
 
     General feedback may contain private grading details. Only agent_feedback is
@@ -262,7 +269,7 @@ class EvaluationResult(EvaluationState):
         return self
 
 
-class ToolBinding(Record):
+class ToolBinding(Record, frozen=True):
     """Bind a genome to an approved, versioned Tool manifest and permissions.
 
     The trusted registry validates the manifest and implementation before execution;
@@ -275,7 +282,7 @@ class ToolBinding(Record):
     permissions: list[str] = Field(default_factory=list)
 
 
-class TaskGenome(Record):
+class TaskGenome(Record, frozen=True):
     """Represent the heritable Skill, Memory and Tool capabilities of one Task Agent.
 
     Task execution reads a fixed version across a batch. Evolution creates a child
@@ -295,7 +302,7 @@ class TaskGenome(Record):
     artifact_status: Literal["draft", "static_validated", "quarantined", "rejected"]
 
 
-class TaskSpec(Record):
+class TaskSpec(Record, frozen=True):
     """Describe a provider-owned task with a public view and separately held private data.
 
     The runtime exposes public payloads to the Task Agent. Partition authorization
@@ -321,7 +328,7 @@ class TaskSpec(Record):
         }
 
 
-class RunPlan(Record):
+class RunPlan(Record, frozen=True):
     """Freeze a batch's genomes, tasks, execution budgets and evaluation settings.
 
     Task sources and evaluators are Host inputs rather than inherited capabilities.
@@ -353,7 +360,7 @@ class RunPlan(Record):
     evaluator_version: str | None = None
 
 
-class TaskResult(Record):
+class TaskResult(Record, frozen=True):
     """Carry an agent's text, structured output and content-addressed artifacts.
 
     The runtime attaches termination and evaluation state after execution. Produced
@@ -369,7 +376,7 @@ class TaskResult(Record):
     evaluation: EvaluationState = Field(default_factory=EvaluationState)
 
 
-class NativeToolCall(Record):
+class NativeToolCall(Record, frozen=True):
     """Represent one provider-native tool request with its correlation identity.
 
     Raw arguments may be retained for protocol receipts, but only validated argument
@@ -382,7 +389,7 @@ class NativeToolCall(Record):
     raw_arguments: str = "{}"
 
 
-class NativeModelTurn(Record):
+class NativeModelTurn(Record, frozen=True):
     """Validate one native model turn containing text, tool calls or a final result.
 
     The Task Loop checks call identities and permissions before dispatching tools.
@@ -394,7 +401,7 @@ class NativeModelTurn(Record):
     result: TaskResult | None = None
 
 
-class TaskRunRecord(Record):
+class TaskRunRecord(Record, frozen=True):
     """Archive one independent execution of a fixed genome on one task instance.
 
     Trace and public evidence references remain separately reloadable. Termination
@@ -430,7 +437,7 @@ class TaskRunRecord(Record):
     task_instance_sha256: str | None = None
 
 
-class TraceEvent(Record):
+class TraceEvent(Record, frozen=True):
     """Record an ordered, sanitized observation of one Task Agent execution.
 
     Capability injection and model-reported Skill use are distinct event evidence;
@@ -460,7 +467,7 @@ class TraceEvent(Record):
     safe_payload: dict[str, Any] = Field(default_factory=dict)
 
 
-class EditHypothesis(Record):
+class EditHypothesis(Record, frozen=True):
     """Suggest a capability edit with its rationale and supporting evidence.
 
     The Evolution Agent must still choose, validate and independently test edits;
@@ -475,7 +482,7 @@ class EditHypothesis(Record):
     uncertainty: str = Field(min_length=1)
 
 
-class PolicyEditHypothesis(Record):
+class PolicyEditHypothesis(Record, frozen=True):
     """Suggest a change to an allowlisted evolution-policy field.
 
     The Meta-Evolution Agent treats this as uncertain guidance from prior attempts,
@@ -490,7 +497,7 @@ class PolicyEditHypothesis(Record):
     uncertainty: str = Field(min_length=1)
 
 
-class RunReflection(Record):
+class RunReflection(Record, frozen=True):
     """Analyze one archived run without rewriting the Task Agent's capabilities.
 
     Observations, strengths, weaknesses and suggested edits retain their evidence
@@ -510,7 +517,7 @@ class RunReflection(Record):
     created_at: datetime = Field(default_factory=now)
 
 
-class TaskExperienceSummary(Record):
+class TaskExperienceSummary(Record, frozen=True):
     """Consolidate multiple runs of one genome into evidence for capability evolution.
 
     Program-computed statistics are stored separately from model-authored strengths,
@@ -535,7 +542,7 @@ class TaskExperienceSummary(Record):
     parent_summary_id: Id | None = None
 
 
-class SkillContent(Record):
+class SkillContent(Record, frozen=True):
     """Supply proposed Skill text and its typed selection/dependency declarations.
 
     The materializer validates the resulting capability set before committing it.
@@ -549,7 +556,7 @@ class SkillContent(Record):
     constraints: dict[str, str] = Field(default_factory=dict)
 
 
-class MemoryContent(Record):
+class MemoryContent(Record, frozen=True):
     """Supply an explicit proposed version of heritable Markdown Memory.
 
     Runtime traces and reflections enter this resource only through an approved
@@ -559,7 +566,7 @@ class MemoryContent(Record):
     content: str = Field(min_length=1)
 
 
-class ToolContent(Record):
+class ToolContent(Record, frozen=True):
     """Propose an existing approved Tool binding or new source for Host review.
 
     Exactly one source is allowed. Generated code remains a proposal and cannot
@@ -579,7 +586,7 @@ class ToolContent(Record):
         return self
 
 
-class EvolutionOperation(Record):
+class EvolutionOperation(Record, frozen=True):
     """Describe one typed inheritance, recombination, mutation, innovation or prune edit.
 
     Source lineage is explicit for inherited resources. New content is typed and
@@ -621,7 +628,7 @@ class EvolutionOperation(Record):
         return self
 
 
-class EvolutionProposal(Record):
+class EvolutionProposal(Record, frozen=True):
     """Propose evidence-linked capability edits under a specific EvolutionPolicy.
 
     Expected benefit and verification plan are hypotheses. Static validity and
@@ -638,7 +645,7 @@ class EvolutionProposal(Record):
     proposal_status: Literal["draft", "static_validated", "quarantined", "rejected"] = "draft"
 
 
-class ValidationReport(Record):
+class ValidationReport(Record, frozen=True):
     """Record static schema, dependency and permission checks on an evolution attempt.
 
     A passed security gate permits materialization; it is not a performance score.
@@ -651,7 +658,7 @@ class ValidationReport(Record):
     errors: list[str]
 
 
-class EvolutionAttemptRecord(Record):
+class EvolutionAttemptRecord(Record, frozen=True):
     """Archive one policy-guided attempt to produce Task Agent offspring.
 
     Parent/child lineage, validation and resources survive failed materialization.
@@ -672,7 +679,7 @@ class EvolutionAttemptRecord(Record):
     decision_ref: str | None = None
 
 
-class EvolutionReflection(Record):
+class EvolutionReflection(Record, frozen=True):
     """Analyze an attempt's materialization or independently observed outcome.
 
     New feedback creates a revision linked to earlier reflections. Strategy-change
@@ -692,7 +699,7 @@ class EvolutionReflection(Record):
     supersedes_reflection_id: Id | None = None
 
 
-class EvolutionOutcomeReflection(EvolutionReflection):
+class EvolutionOutcomeReflection(EvolutionReflection, frozen=True):
     """Specialize an attempt reflection for post-execution outcome evidence.
 
     This phase can discuss comparisons while preserving the original static report.
@@ -701,7 +708,7 @@ class EvolutionOutcomeReflection(EvolutionReflection):
     reflection_phase: Literal["outcome"] = "outcome"
 
 
-class EvolutionDecision(Record):
+class EvolutionDecision(Record, frozen=True):
     """Record L2 parent selection, objective and expected benefit before proposing edits.
 
     Selection rationale cites archived experience; its expectation remains uncertain
@@ -719,7 +726,7 @@ class EvolutionDecision(Record):
     parent_selection_ref: str | None = None
 
 
-class EvolutionExperienceSummary(Record):
+class EvolutionExperienceSummary(Record, frozen=True):
     """Consolidate multiple attempts under one policy into evidence for meta-evolution.
 
     Effective patterns, bottlenecks and strategy hypotheses are distinct from the
@@ -743,7 +750,7 @@ class EvolutionExperienceSummary(Record):
     comparison_refs: list[EvidenceRef] = Field(default_factory=list)
 
 
-class ParentSelectionConfig(Record):
+class ParentSelectionConfig(Record, frozen=True):
     """Configure evidence-aware parent ranking and exploratory capability diversity.
 
     Weights guide a semantic heuristic rather than define universal objective
@@ -757,7 +764,7 @@ class ParentSelectionConfig(Record):
     exploration_weight: float = Field(default=0.25, ge=0)
 
 
-class EvolutionPolicy(Record):
+class EvolutionPolicy(Record, frozen=True):
     """Version L2 diagnosis, selection and operation guidance as an evolvable object.
 
     Meta-Evolution can create a descendant policy, separate from a TaskGenome.
@@ -784,7 +791,7 @@ class EvolutionPolicy(Record):
     created_at: datetime = Field(default_factory=now)
 
 
-class PolicyProposal(Record):
+class PolicyProposal(Record, frozen=True):
     """Archive the Meta-Evolution Agent's evidence-linked policy change set.
 
     The child is a candidate strategy version until an independent matched trial
@@ -800,7 +807,7 @@ class PolicyProposal(Record):
     change_set: dict[str, Any]
 
 
-class MetaPolicyTrial(Record):
+class MetaPolicyTrial(Record, frozen=True):
     """Archive an independent old/new evolution-policy comparison and fixed decision.
 
     Run plans, seeds and objective metrics remain reloadable evidence. An invalid,
@@ -831,10 +838,15 @@ class MetaPolicyTrial(Record):
 
 def heas_ext(record: Record) -> dict[str, Any]:
     """Return producer-namespaced HEAS extensions from a versioned record."""
-    return dict(record.extensions.get("heas", {}))
+    metadata = record.extensions.get("heas")
+    if metadata is None:
+        return {}
+    if not isinstance(metadata, dict):
+        raise ValueError("HEAS extension metadata must be an object when supplied")
+    return dict(metadata)
 
 
-class AgentObservation(Record):
+class AgentObservation(Record, frozen=True):
     """Expose public environment state to one independent Task Agent.
 
     Private grading inputs belong to the external evaluator and must not appear
@@ -844,7 +856,7 @@ class AgentObservation(Record):
     public_data: dict[str, Any]
 
 
-class RunEvidencePackage(Record):
+class RunEvidencePackage(Record, frozen=True):
     """Freeze the public task, injected capabilities, trace and output for one run.
 
     Reflections consume this package rather than private evaluator payloads. The

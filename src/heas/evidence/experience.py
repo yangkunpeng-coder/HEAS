@@ -22,14 +22,14 @@ from heas.core.domain import (
     TaskRunRecord,
     uid,
 )
-from heas.core.errors import HEASError, MissingEvidence
+from heas.core.errors import HEASError, IntegrityError, MissingEvidence
 from heas.evidence.aggregation import AggregationConfig, HierarchicalExperienceAggregator, bounded
 from heas.infrastructure.context import EvidenceRetriever
 from heas.infrastructure.model import CallBudget, ModelGateway
 from heas.infrastructure.storage import FileStore, digest
 
 
-class RunAnalysis(Record):
+class RunAnalysis(Record, frozen=True):
     """Validate model reflection claims about one independently recorded execution."""
 
     observations: list[Claim]
@@ -39,7 +39,7 @@ class RunAnalysis(Record):
     suggested_capability_edits: list[EditHypothesis]
 
 
-class TaskAnalysis(Record):
+class TaskAnalysis(Record, frozen=True):
     """Validate capability diagnoses and hypotheses over a multi-run task window."""
 
     strengths: list[Claim]
@@ -49,7 +49,7 @@ class TaskAnalysis(Record):
     evolution_hypotheses: list[EditHypothesis]
 
 
-class EvolutionAnalysis(Record):
+class EvolutionAnalysis(Record, frozen=True):
     """Validate an attempt reflection without accepting self-assessed objective gains."""
 
     observations: list[Claim]
@@ -57,7 +57,7 @@ class EvolutionAnalysis(Record):
     strategy_change_hypotheses: list[PolicyEditHypothesis]
 
 
-class EvolutionWindowAnalysis(Record):
+class EvolutionWindowAnalysis(Record, frozen=True):
     """Validate evidence-linked conclusions about multiple evolution attempts."""
 
     effective_patterns: list[Claim]
@@ -177,11 +177,12 @@ class ExperienceService:
         if TaskRunRecord.model_validate(persisted) != run:
             raise HEASError("run is not identical to persisted evidence")
         events = self.store.trace(run.trace_ref)
-        if not run.evidence_ref:
+        evidence_uri = run.evidence_ref
+        if not evidence_uri:
             raise HEASError("reflection requires a complete RunEvidencePackage")
-        if digest(self.store.path(run.evidence_ref).read_bytes()) != run.evidence_sha256:
+        if digest(self.store.path(evidence_uri).read_bytes()) != run.evidence_sha256:
             raise HEASError("run evidence package hash mismatch")
-        package = self.store.load(run.evidence_ref, RunEvidencePackage)
+        package = self.store.load(evidence_uri, RunEvidencePackage)
         if package.run_id != run.run_id or package.genome.genome_id != run.genome_id:
             raise HEASError("run evidence package identity mismatch")
         allowed = {("trace_event", e.event_id) for e in events} | {("task_run", run.run_id)}
@@ -258,7 +259,8 @@ class ExperienceService:
             saved = self.store.resolve(EvidenceRef(ref_type="task_run", ref_id=run.run_id))
             if TaskRunRecord.model_validate(saved) != run:
                 raise HEASError("summary input differs from immutable run")
-            if not run.evidence_ref or digest(self.store.path(run.evidence_ref).read_bytes()) != (
+            evidence_uri = run.evidence_ref
+            if not evidence_uri or digest(self.store.path(evidence_uri).read_bytes()) != (
                 run.evidence_sha256
             ):
                 raise HEASError("summary requires hash-verified complete run evidence")
@@ -333,8 +335,10 @@ class ExperienceService:
         for run in runs:
             if previous_summary and run.run_id not in incoming_ids:
                 continue
-            assert run.evidence_ref is not None
-            package = self.store.load(run.evidence_ref, RunEvidencePackage)
+            evidence_uri = run.evidence_ref
+            if not evidence_uri:
+                raise HEASError("summary requires complete run evidence")
+            package = self.store.load(evidence_uri, RunEvidencePackage)
             events = [
                 e
                 for e in package.events
@@ -405,6 +409,22 @@ class ExperienceService:
         )
         return summary
 
+    def _outcome_comparison_refs(self, outcome: dict[str, Any]) -> list[EvidenceRef]:
+        """Collect present comparison URIs, rejecting malformed required outcome objects."""
+        children = outcome.get("offspring")
+        if not isinstance(children, list):
+            raise IntegrityError("evolution outcome requires an offspring list")
+        refs = []
+        for child in children:
+            if not isinstance(child, dict) or not isinstance(child.get("candidate"), dict):
+                raise IntegrityError("evolution offspring requires a candidate object")
+            candidate = child["candidate"]
+            comparison_uri = candidate.get("comparison_ref")
+            # An unassessed candidate legitimately has no comparison evidence.
+            if comparison_uri is not None:
+                refs.append(self.store.json_record_ref(comparison_uri, "candidate_comparison"))
+        return refs
+
     def reflect_attempt(self, attempt: EvolutionAttemptRecord) -> EvolutionReflection:
         """Append a materialization or outcome reflection for one archived attempt.
 
@@ -413,12 +433,16 @@ class ExperienceService:
         """
         refs = [EvidenceRef(ref_type="evolution_attempt", ref_id=attempt.evolution_attempt_id)]
         outcome_uri = f"evolution/attempts/{attempt.evolution_attempt_id}/outcome.json"
-        outcome = self.store.read(outcome_uri) if self.store.path(outcome_uri).exists() else None
+        outcome = (
+            self.store.read_object(outcome_uri) if self.store.path(outcome_uri).exists() else None
+        )
         execution_evidence = []
         directory = f"evolution/attempts/{attempt.evolution_attempt_id}"
         validation_uri = f"{directory}/validation_outcome.json"
         validation = (
-            self.store.read(validation_uri) if self.store.path(validation_uri).exists() else None
+            self.store.read_object(validation_uri)
+            if self.store.path(validation_uri).exists()
+            else None
         )
         if outcome and validation:
             outcome = {**outcome, "validation_outcome": validation}
@@ -426,15 +450,7 @@ class ExperienceService:
             refs.append(
                 EvidenceRef(ref_type="evolution_outcome", ref_id=attempt.evolution_attempt_id)
             )
-            for child in outcome["offspring"]:
-                comparison_uri = child["candidate"].get("comparison_ref")
-                if comparison_uri:
-                    refs.append(
-                        EvidenceRef(
-                            ref_type="candidate_comparison",
-                            ref_id=comparison_uri.rsplit("/", 1)[-1][:-5],
-                        )
-                    )
+            refs.extend(self._outcome_comparison_refs(outcome))
             run_groups = [child["run_ids"] for child in outcome["offspring"]]
             if validation:
                 run_groups.append(validation["run_ids"])
@@ -541,14 +557,14 @@ class ExperienceService:
                 if self.store.path(
                     f"evolution/attempts/{a.evolution_attempt_id}/validation_outcome.json"
                 ).exists()
-                else outcome["evaluation_status"]
-                if outcome
+                else attempt_outcome["evaluation_status"]
+                if attempt_outcome
                 else a.evaluation.evaluation_status
             )
             == "completed"
-            for a, outcome in zip(attempts, outcomes, strict=True)
+            for a, attempt_outcome in zip(attempts, outcomes, strict=True)
         )
-        stats = {
+        stats: dict[str, Any] = {
             "schema_version": "1.0",
             "attempts": len(attempts),
             "valid_candidates": valid,
@@ -562,10 +578,10 @@ class ExperienceService:
             ),
             "resource_usage": {
                 field: sum(
-                    outcome["resource_usage"][field]
-                    if outcome
+                    attempt_outcome["resource_usage"][field]
+                    if attempt_outcome
                     else getattr(a.resource_usage, field)
-                    for a, outcome in zip(attempts, outcomes, strict=True)
+                    for a, attempt_outcome in zip(attempts, outcomes, strict=True)
                 )
                 for field in (
                     "model_calls",
@@ -615,14 +631,7 @@ class ExperienceService:
                 refs_for_row.append(
                     EvidenceRef(ref_type="evolution_outcome", ref_id=attempt.evolution_attempt_id)
                 )
-                for child in outcome["offspring"]:
-                    uri = child["candidate"].get("comparison_ref")
-                    if uri:
-                        comparison_refs.append(
-                            EvidenceRef(
-                                ref_type="candidate_comparison", ref_id=uri.rsplit("/", 1)[-1][:-5]
-                            )
-                        )
+                comparison_refs.extend(self._outcome_comparison_refs(outcome))
             rows.append(
                 {
                     "source_ref": EvidenceRef(
@@ -635,10 +644,13 @@ class ExperienceService:
                     "outcome": bounded(outcome),
                     "reflection": bounded(reflection),
                     "costs": costs,
-                    "outcome_refs": [ref.model_dump(mode="json") for ref in refs_for_row],
+                    "outcome_refs": [
+                        outcome_reference.model_dump(mode="json")
+                        for outcome_reference in refs_for_row
+                    ],
                 }
             )
-        stats["resource_usage"] = {
+        resource_totals: dict[str, int | float | bool | None] = {
             field: sum(row["costs"].get(field, 0) for row in rows)
             for field in (
                 "model_calls",
@@ -648,27 +660,28 @@ class ExperienceService:
                 "wall_seconds",
             )
         }
-        stats["resource_usage"]["token_usage_available"] = all(
+        resource_totals["token_usage_available"] = all(
             row["costs"].get("token_usage_available", True) for row in rows
         )
-        if not stats["resource_usage"]["token_usage_available"]:
-            stats["resource_usage"]["input_tokens"] = None
-            stats["resource_usage"]["output_tokens"] = None
+        if not resource_totals["token_usage_available"]:
+            resource_totals["input_tokens"] = None
+            resource_totals["output_tokens"] = None
+        stats["resource_usage"] = resource_totals
         stats["operation_counts"] = dict(operation_counts)
         stats["outcome_coverage"] = sum(o is not None for o in outcomes)
         stats["comparison_status_counts"] = dict(
             Counter(
                 child["candidate"]["comparison_status"]
-                for outcome in outcomes
-                if outcome
-                for child in outcome["offspring"]
+                for attempt_outcome in outcomes
+                if attempt_outcome
+                for child in attempt_outcome["offspring"]
             )
         )
         scope: set[tuple[str, str]] = {(r.ref_type, r.ref_id) for r in refs}
         scope.update(
             ("evolution_outcome", a.evolution_attempt_id)
-            for a, outcome in zip(attempts, outcomes, strict=True)
-            if outcome
+            for a, attempt_outcome in zip(attempts, outcomes, strict=True)
+            if attempt_outcome
         )
         scope.update((r.ref_type, r.ref_id) for r in comparison_refs)
         semantic, aggregation_ref = self.aggregator.aggregate(
@@ -689,8 +702,8 @@ class ExperienceService:
             aggregation_ref=aggregation_ref,
             outcome_refs=[
                 EvidenceRef(ref_type="evolution_outcome", ref_id=a.evolution_attempt_id)
-                for a, outcome in zip(attempts, outcomes, strict=True)
-                if outcome
+                for a, attempt_outcome in zip(attempts, outcomes, strict=True)
+                if attempt_outcome
             ],
             comparison_refs=comparison_refs,
             policy_id=attempts[0].policy_id,

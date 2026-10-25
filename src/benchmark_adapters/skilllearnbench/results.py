@@ -35,8 +35,8 @@ def trial_metrics(
             raise BenchmarkProtocolError("official trial is missing binary pass/reward fields")
         if row["passed"] != (row["reward"] == 1):
             raise BenchmarkProtocolError("official pass and reward fields disagree")
-    rate = sum(row["passed"] for row in rows) / len(rows)
-    return {"pass_rate": rate}, all(row["passed"] for row in rows)
+    rate = sum(trial_record["passed"] for trial_record in rows) / len(rows)
+    return {"pass_rate": rate}, all(trial_record["passed"] for trial_record in rows)
 
 
 def quality_metrics(path: Path) -> dict[str, float]:

@@ -4,8 +4,10 @@ import json
 import os
 import time
 from collections.abc import Callable
-from typing import Any, TypeVar
+from dataclasses import dataclass
+from typing import Any, Generic, TypeVar
 
+from openai.types.chat import ChatCompletionMessage
 from pydantic import ValidationError
 
 from heas.core.domain import Budget, NativeModelTurn, NativeToolCall, Record, Usage, uid
@@ -15,6 +17,14 @@ from heas.infrastructure.context import ContextBudgetManager, ContextBuilder
 from heas.infrastructure.storage import FileStore, digest, encode, redact
 
 R = TypeVar("R", bound=Record)
+
+
+@dataclass
+class _StructuredOutput(Generic[R]):
+    """Retain raw repair evidence separately from the validated record type."""
+
+    data: dict[str, Any] | None = None
+    record: R | None = None
 
 
 class CallBudget:
@@ -44,13 +54,14 @@ class CallBudget:
             )
         ):
             raise BudgetExceeded("cannot enforce token/cost limits without provider usage")
-        if self.budget.max_input_tokens is not None:
-            if self.input_tokens > self.budget.max_input_tokens:
-                raise BudgetExceeded("input token budget exceeded")
-        if self.budget.max_output_tokens is not None:
-            if self.output_tokens > self.budget.max_output_tokens:
-                raise BudgetExceeded("output token budget exceeded")
-        if self.budget.max_cost is not None and self.cost > self.budget.max_cost:
+        input_limit = self.budget.max_input_tokens
+        output_limit = self.budget.max_output_tokens
+        cost_limit = self.budget.max_cost
+        if input_limit is not None and self.input_tokens > input_limit:
+            raise BudgetExceeded("input token budget exceeded")
+        if output_limit is not None and self.output_tokens > output_limit:
+            raise BudgetExceeded("output token budget exceeded")
+        if cost_limit is not None and self.cost > cost_limit:
             raise BudgetExceeded("monetary budget exceeded")
 
     @property
@@ -165,36 +176,7 @@ class ModelGateway:
         client = self.client_for(purpose)
         meters = self.meters(meter)
         payload = redact(context)
-        input_bound = len(encode(payload))
-        remaining = None
-        for current in meters:
-            current.check()
-            if current.model_calls >= current.budget.max_model_calls:
-                raise BudgetExceeded("model call budget exceeded")
-            if (
-                current.budget.max_input_tokens is not None
-                and current.input_tokens + input_bound > current.budget.max_input_tokens
-            ):
-                raise BudgetExceeded("conservative input token precheck exceeded")
-            limits = []
-            if current.budget.max_output_tokens is not None:
-                limits.append(current.budget.max_output_tokens - current.output_tokens)
-            pricing = current.budget.pricing
-            if current.budget.max_cost is not None and pricing:
-                funds = (
-                    current.budget.max_cost
-                    - current.cost
-                    - (input_bound * pricing.input_per_million / 1_000_000)
-                )
-                if funds < 0:
-                    raise BudgetExceeded("estimated input exceeds monetary budget")
-                if pricing.output_per_million > 0:
-                    limits.append(int(funds * 1_000_000 / pricing.output_per_million))
-            if limits:
-                cap = min(limits)
-                remaining = cap if remaining is None else min(remaining, cap)
-        if remaining is not None and remaining <= 0:
-            raise BudgetExceeded("output/cost budget exhausted")
+        remaining = self._output_allowance(meters, payload)
         call_id = uid("call")
         call_started = time.monotonic()
         for current in meters:
@@ -223,54 +205,7 @@ class ModelGateway:
             )
             if not isinstance(result, dict):
                 raise ModelProtocolError("model envelope must be an object")
-            usage = result.get("usage")
-            measured = (
-                Usage.model_validate(usage)
-                if usage is not None
-                else Usage(token_usage_available=False)
-            )
-            receipt.update(
-                {
-                    "usage": measured.model_dump(mode="json"),
-                    "response_sha256": digest(encode(result.get("data"))),
-                    "provider_request_id": result.get("provider_request_id"),
-                    "provider_model": result.get("provider_model"),
-                    "request_parameters": result.get("request_parameters", {}),
-                }
-            )
-            for current in meters:
-                current.input_tokens += measured.input_tokens
-                current.output_tokens += measured.output_tokens
-                current.usage_available &= measured.token_usage_available
-                pricing = current.budget.pricing
-                if pricing:
-                    current.cost += (
-                        measured.input_tokens * pricing.input_per_million
-                        + measured.output_tokens * pricing.output_per_million
-                    ) / 1_000_000
-            pricing = next((m.budget.pricing for m in meters if m.budget.pricing), None)
-            receipt["monetary_cost"] = (
-                (
-                    measured.input_tokens * pricing.input_per_million
-                    + measured.output_tokens * pricing.output_per_million
-                )
-                / 1_000_000
-                if pricing and measured.token_usage_available
-                else None
-            )
-            receipt["currency"] = pricing.currency if pricing else None
-            receipt["pricing"] = pricing.model_dump(mode="json") if pricing else None
-            for current in meters:
-                if not measured.token_usage_available and any(
-                    limit is not None
-                    for limit in (
-                        current.budget.max_input_tokens,
-                        current.budget.max_output_tokens,
-                        current.budget.max_cost,
-                    )
-                ):
-                    raise BudgetExceeded("cannot enforce token/cost limits without provider usage")
-                current.check()
+            self._account_response(result, receipt, meters)
             data = result.get("data")
             if not isinstance(data, dict):
                 raise ModelProtocolError("model response data must be a JSON object", data)
@@ -280,29 +215,14 @@ class ModelGateway:
                 validator(data)
             receipt["status"] = "completed"
             return data
-        except Exception as exc:
+        except BaseException as exc:
+            # Audit failures and interruptions, then preserve the exception for
+            # its owning boundary. A cancelled request may already have been billed.
             if "usage" not in receipt:
                 for current in meters:
                     current.usage_available = False
             receipt["error_type"] = type(exc).__name__
-            category = type(exc).__name__.lower()
-            receipt["status"] = (
-                "validation_failed"
-                if isinstance(exc, ValidationError)
-                else "protocol_error"
-                if isinstance(exc, ModelProtocolError)
-                else "budget_exceeded"
-                if isinstance(exc, BudgetExceeded)
-                else "timeout"
-                if isinstance(exc, TimeoutError) or "timeout" in category
-                else "rate_limited"
-                if "ratelimit" in category
-                else "network_error"
-                if isinstance(exc, ConnectionError) or "connection" in category
-                else "rejected"
-                if isinstance(exc, HEASError)
-                else "failed"
-            )
+            receipt["status"] = self._failure_status(exc)
             receipt["error_message"] = "Model call failed: " + type(exc).__name__
             raise
         finally:
@@ -310,6 +230,114 @@ class ModelGateway:
             self.store.put(f"model_calls/{call_id}.json", receipt)
             for mirror in self.audit_mirrors:
                 mirror.put(f"model_calls/{call_id}.json", receipt)
+
+    def _output_allowance(self, meters: list[CallBudget], payload: dict[str, Any]) -> int | None:
+        """Preflight all scopes before reserving a possibly billed provider request."""
+        input_bound = len(encode(payload))
+        remaining = None
+        for current in meters:
+            current.check()
+            if current.model_calls >= current.budget.max_model_calls:
+                raise BudgetExceeded("model call budget exceeded")
+            input_limit = current.budget.max_input_tokens
+            output_limit = current.budget.max_output_tokens
+            cost_limit = current.budget.max_cost
+            if input_limit is not None and current.input_tokens + input_bound > input_limit:
+                raise BudgetExceeded("conservative input token precheck exceeded")
+            limits = []
+            if output_limit is not None:
+                limits.append(output_limit - current.output_tokens)
+            pricing = current.budget.pricing
+            if cost_limit is not None and pricing:
+                funds = (
+                    cost_limit
+                    - current.cost
+                    - (input_bound * pricing.input_per_million / 1_000_000)
+                )
+                if funds < 0:
+                    raise BudgetExceeded("estimated input exceeds monetary budget")
+                if pricing.output_per_million > 0:
+                    limits.append(int(funds * 1_000_000 / pricing.output_per_million))
+            if limits:
+                cap = min(limits)
+                remaining = cap if remaining is None else min(remaining, cap)
+        if remaining is not None and remaining <= 0:
+            raise BudgetExceeded("output/cost budget exhausted")
+        return remaining
+
+    def _account_response(
+        self, result: dict[str, Any], receipt: dict[str, Any], meters: list[CallBudget]
+    ) -> None:
+        """Charge measured usage before validating content, including malformed JSON.
+
+        Unknown usage prevents further calls with hard token or monetary limits.
+        Content validation must follow accounting so a rejected response remains
+        charged in every enclosing resource scope.
+        """
+        usage = result.get("usage")
+        measured = (
+            Usage.model_validate(usage) if usage is not None else Usage(token_usage_available=False)
+        )
+        receipt.update(
+            {
+                "usage": measured.model_dump(mode="json"),
+                "response_sha256": digest(encode(result.get("data"))),
+                "provider_request_id": result.get("provider_request_id"),
+                "provider_model": result.get("provider_model"),
+                "request_parameters": result.get("request_parameters", {}),
+            }
+        )
+        for current in meters:
+            current.input_tokens += measured.input_tokens
+            current.output_tokens += measured.output_tokens
+            current.usage_available &= measured.token_usage_available
+            pricing = current.budget.pricing
+            if pricing:
+                current.cost += (
+                    measured.input_tokens * pricing.input_per_million
+                    + measured.output_tokens * pricing.output_per_million
+                ) / 1_000_000
+        pricing = next((m.budget.pricing for m in meters if m.budget.pricing), None)
+        receipt["monetary_cost"] = (
+            (
+                measured.input_tokens * pricing.input_per_million
+                + measured.output_tokens * pricing.output_per_million
+            )
+            / 1_000_000
+            if pricing and measured.token_usage_available
+            else None
+        )
+        receipt["currency"] = pricing.currency if pricing else None
+        receipt["pricing"] = pricing.model_dump(mode="json") if pricing else None
+        for current in meters:
+            if not measured.token_usage_available and any(
+                limit is not None
+                for limit in (
+                    current.budget.max_input_tokens,
+                    current.budget.max_output_tokens,
+                    current.budget.max_cost,
+                )
+            ):
+                raise BudgetExceeded("cannot enforce token/cost limits without provider usage")
+            current.check()
+
+    @staticmethod
+    def _failure_status(error: BaseException) -> str:
+        """Classify a failure without exposing provider or private evaluation text."""
+        if isinstance(error, ValidationError):
+            return "validation_failed"
+        if isinstance(error, ModelProtocolError):
+            return "protocol_error"
+        if isinstance(error, BudgetExceeded):
+            return "budget_exceeded"
+        category = type(error).__name__.lower()
+        if isinstance(error, TimeoutError) or "timeout" in category:
+            return "timeout"
+        if "ratelimit" in category:
+            return "rate_limited"
+        if isinstance(error, ConnectionError) or "connection" in category:
+            return "network_error"
+        return "rejected" if isinstance(error, HEASError) else "failed"
 
     def structured(
         self,
@@ -319,20 +347,38 @@ class ModelGateway:
         cls: type[R],
         validate: Callable[[R], Any] | None = None,
     ) -> R:
-        """Validate typed model output with bounded, fully metered repair attempts."""
+        """Validate a concrete record with bounded, fully metered repair attempts.
+
+        Args:
+            purpose: Role-specific provider selection and audit label.
+            context: Public evidence and instructions retained across repair attempts.
+            meter: Shared resource scope charged for invalid outputs as well.
+            cls: Record type whose schema governs every attempt.
+            validate: Fixed Host check for evidence scope or other admission rules.
+
+        Returns:
+            An instance of the requested record type after all checks pass.
+
+        Raises:
+            ValidationError: Schema validation still fails after bounded repair.
+            ModelProtocolError: Invalid JSON remains after bounded repair.
+            HEASError: A fixed validator rejects the output; this is not repairable here.
+        """
         request_id = uid("structured")
         original = {**context, "response_schema": cls.model_json_schema()}
         request = original
         for index in range(self.structured_repair_limit + 1):
-            checked: dict[str, Any] = {}
+            checked = _StructuredOutput[R]()
 
-            def check(data: dict[str, Any], checked: dict[str, Any] = checked) -> None:
+            def check(
+                response_data: dict[str, Any], validation_state: _StructuredOutput[R] = checked
+            ) -> None:
                 """Validate the typed output and its evidence before accepting the receipt."""
-                checked["data"] = data
-                record = cls.model_validate(data, strict=True)
+                validation_state.data = response_data
+                validated_record = cls.model_validate(response_data, strict=True)
                 if validate:
-                    validate(record)
-                checked["record"] = record
+                    validate(validated_record)
+                validation_state.record = validated_record
 
             try:
                 self.call(
@@ -343,7 +389,9 @@ class ModelGateway:
                     request_group_id=request_id,
                     retry_index=index,
                 )
-                record = checked["record"]
+                record = checked.record
+                if record is None:
+                    raise HEASError("model validator did not produce a typed record")
                 if index:
                     self.store.put(
                         f"structured_calls/{request_id}/result.json",
@@ -356,7 +404,9 @@ class ModelGateway:
                     )
                 return record
             except (ValidationError, ModelProtocolError) as exc:
-                data = checked.get("data", exc.data if isinstance(exc, ModelProtocolError) else {})
+                data: object = checked.data
+                if data is None:
+                    data = exc.data if isinstance(exc, ModelProtocolError) else {}
                 errors = (
                     [
                         {"loc": list(e["loc"]), "type": e["type"]}
@@ -397,7 +447,7 @@ class ModelGateway:
                         "purpose": purpose,
                         "status": "rejected_by_fixed_validator",
                         "error_type": type(exc).__name__,
-                        "output": redact(checked.get("data")),
+                        "output": redact(checked.data),
                         "resource_usage": meter.usage().model_dump(mode="json"),
                     },
                 )
@@ -470,8 +520,21 @@ class DeepSeekClient:
         timeout: float,
         max_output_tokens: int | None = None,
     ) -> dict[str, Any]:
-        # One request only; controller records failures and enforces total call/time limits.
-        """Perform one provider transport request and return its response with usage evidence."""
+        """Make one SDK request and retain usage even when response content is invalid.
+
+        Transport exceptions propagate to ModelGateway for classification. Content
+        failures return reserved protocol markers so billing evidence reaches the
+        ledger before rejection. There are no hidden SDK retries.
+
+        Args:
+            purpose: Role label selecting JSON or native task protocol.
+            context: Host-built public messages and approved tool schemas.
+            timeout: Remaining wall-clock allowance for this request.
+            max_output_tokens: Optional output cap computed by the gateway.
+
+        Returns:
+            A provider envelope containing decoded data, usage and request metadata.
+        """
         kwargs: dict[str, Any] = {}
         if max_output_tokens is not None:
             kwargs["max_tokens"] = max_output_tokens
@@ -504,41 +567,24 @@ class DeepSeekClient:
                     for name, schema in schemas.items()
                 ]
         response = self.client.chat.completions.create(**kwargs)
-        message = response.choices[0].message
-        if purpose == "task" and self.tool_protocol == "native":
-            calls = []
-            for call in message.tool_calls or []:
-                try:
-                    args = json.loads(call.function.arguments)
-                    if not isinstance(args, dict):
-                        args = None
-                except (ValueError, TypeError):
-                    args = None
-                calls.append(
-                    NativeToolCall(
-                        call_id=call.id,
-                        tool_id=call.function.name,
-                        arguments=args,
-                        raw_arguments=call.function.arguments,
-                    )
-                )
-            data = NativeModelTurn(content=message.content, tool_calls=calls).model_dump(
-                mode="json"
+        usage = response.usage
+        # A malformed completion may still be billed. Return a protocol marker
+        # with its usage so the gateway can charge and archive it before rejection.
+        message = response.choices[0].message if response.choices else None
+        data = (
+            self._response_data(
+                message, native=purpose == "task" and self.tool_protocol == "native"
             )
-        else:
-            try:
-                data = json.loads(message.content or "{}")
-            except (ValueError, TypeError):
-                data = {"invalid_json_text": message.content or ""}
-            if not isinstance(data, dict):
-                data = {"invalid_json_value": data}
+            if message is not None
+            else {"invalid_json_value": None}
+        )
         return {
             "data": data,
             "usage": {
-                "input_tokens": response.usage.prompt_tokens,
-                "output_tokens": response.usage.completion_tokens,
+                "input_tokens": usage.prompt_tokens,
+                "output_tokens": usage.completion_tokens,
             }
-            if response.usage
+            if usage is not None
             else None,
             "provider_request_id": response.id if isinstance(response.id, str) else None,
             "provider_model": response.model if isinstance(response.model, str) else self.model,
@@ -548,3 +594,49 @@ class DeepSeekClient:
                 if k in kwargs
             },
         }
+
+    @staticmethod
+    def _response_data(message: ChatCompletionMessage, *, native: bool) -> dict[str, Any]:
+        """Decode SDK content while preserving rejected data for the gateway ledger."""
+        if not native:
+            content = message.content
+            try:
+                value = json.loads(content) if content is not None else None
+            except (ValueError, TypeError):
+                return {"invalid_json_text": content}
+            return value if isinstance(value, dict) else {"invalid_json_value": value}
+        calls = []
+        for call in message.tool_calls or []:
+            function = getattr(call, "function", None)
+            raw_arguments = getattr(function, "arguments", None)
+            tool_id = getattr(function, "name", None)
+            call_id = call.id
+            if not isinstance(call_id, str) or not call_id:
+                return {"invalid_json_value": None}
+            if not isinstance(tool_id, str) or not tool_id:
+                return {"invalid_json_value": None}
+            if not isinstance(raw_arguments, str):
+                return {"invalid_json_value": None}
+            try:
+                arguments = json.loads(raw_arguments)
+                if not isinstance(arguments, dict):
+                    arguments = None
+            except (ValueError, TypeError):
+                arguments = None
+            try:
+                calls.append(
+                    NativeToolCall(
+                        call_id=call_id,
+                        tool_id=tool_id,
+                        arguments=arguments,
+                        raw_arguments=raw_arguments,
+                    )
+                )
+            except ValidationError:
+                return {"invalid_json_value": None}
+        try:
+            return NativeModelTurn(content=message.content, tool_calls=calls).model_dump(
+                mode="json"
+            )
+        except ValidationError:
+            return {"invalid_json_value": None}

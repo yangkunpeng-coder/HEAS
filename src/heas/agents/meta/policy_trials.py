@@ -3,7 +3,7 @@
 from contextlib import ExitStack
 from typing import Any, Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, TypeAdapter, model_validator
 
 from heas.agents.evolution.candidates import compare_windows
 from heas.agents.meta.meta import load_policy
@@ -19,13 +19,15 @@ from heas.core.domain import (
     TaskExperienceSummary,
     uid,
 )
-from heas.core.errors import HEASError, RecoveryRequired
+from heas.core.errors import HEASError, IntegrityError, RecoveryRequired
 from heas.experimentation.isolation import IsolatedPolicyTrialRunner, ServiceFactory
+from heas.experimentation.ports import ExperimentServices
 from heas.infrastructure.model import CallBudget
 from heas.infrastructure.resources import ResourceLedger
+from heas.infrastructure.storage import FileStore
 
 
-class PolicyTrialSpec(Record):
+class PolicyTrialSpec(Record, frozen=True):
     """Freeze independent policy comparison conditions and host-owned admission rules."""
 
     schema_version: Literal["1.1"] = "1.1"
@@ -60,20 +62,25 @@ class PolicyTrialSpec(Record):
 class EvolutionPolicyManager:
     """Activate independently validated policies and retain rollback history."""
 
-    def __init__(self, store: Any):
+    def __init__(self, store: FileStore):
         self.store = store
 
     def history(self) -> list[dict[str, Any]]:
         """Return the ordered, immutable policy activation history."""
         return [
-            self.store.read(p.relative_to(self.store.root).as_posix())
+            self.store.read_object(p.relative_to(self.store.root).as_posix())
             for p in sorted(self.store.path("policies/activations").glob("*.json"))
         ]
 
     def active(self) -> str | None:
         """Read the most recently approved active policy identity."""
         history = self.history()
-        return history[-1]["policy_id"] if history else None
+        if not history:
+            return None
+        policy_id = history[-1].get("policy_id")
+        if not isinstance(policy_id, str) or not policy_id:
+            raise IntegrityError("policy activation requires a nonempty policy identity")
+        return policy_id
 
     def _activate(self, policy_id: str, reason: str, trial_id: str | None = None) -> None:
         history = self.history()
@@ -101,16 +108,17 @@ class EvolutionPolicyManager:
         trial = MetaPolicyTrial.model_validate(
             self.store.resolve(EvidenceRef(ref_type="policy_trial", ref_id=trial_id))
         )
+        metrics_uri = trial.objective_metrics_ref
         if (
             trial.comparison_status != "completed"
             or trial.decision != "adopt"
             or trial.old_policy_id != self.active()
-            or not trial.objective_metrics_ref
+            or not metrics_uri
         ):
             raise HEASError(
                 "policy lacks an independent completed comparison against active baseline"
             )
-        metrics = self.store.read(trial.objective_metrics_ref)
+        metrics = self.store.read_object(metrics_uri)
         if not metrics["round_comparisons"]:
             raise HEASError("trial has no comparison evidence")
         fresh = [
@@ -135,7 +143,7 @@ class EvolutionPolicyManager:
 class PolicyTrialService:
     """Compare policies in matched, isolated branches under fixed host criteria."""
 
-    def __init__(self, services: Any, factory: ServiceFactory | None = None):
+    def __init__(self, services: ExperimentServices, factory: ServiceFactory | None = None):
         self.services = services
         self.factory = factory
         self.store = services.store
@@ -183,8 +191,7 @@ class PolicyTrialService:
             sides.append(side)
             store.put(f"{directory}/execution/{len(sides) + 1:06d}.json", side)
         comparisons = []
-        status: Any = "invalid"
-        decision: Any = "undecided"
+        status: Literal["invalid", "completed", "not_available"] = "invalid"
         improvement = None
         if all(s["status"] == "completed" for s in sides):
             for before, after in zip(sides[0]["rounds"], sides[1]["rounds"], strict=True):
@@ -199,7 +206,10 @@ class PolicyTrialService:
                 status = "not_available"
         metrics_uri = f"{directory}/metrics.json"
         assessment = assess_trial(comparisons, sides, spec.criteria)
-        decision = assessment["decision"]
+        decision_validator: TypeAdapter[Literal["adopt", "reject", "undecided"]] = TypeAdapter(
+            Literal["adopt", "reject", "undecided"]
+        )
+        decision = decision_validator.validate_python(assessment["decision"])
         store.put(
             metrics_uri,
             {
@@ -368,8 +378,8 @@ class PolicyTrialService:
 
     def _repeat(
         self,
-        services: Any,
-        policy: Any,
+        services: ExperimentServices,
+        policy: EvolutionPolicy,
         spec: PolicyTrialSpec,
         side: dict[str, Any],
         repetition: int,

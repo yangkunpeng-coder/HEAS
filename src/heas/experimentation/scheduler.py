@@ -72,8 +72,8 @@ class SerialBatchScheduler:
                             self.store.read(p.relative_to(self.store.root).as_posix())
                             for p in self.store.path(f"{unit_uri}/attempts").glob("*.json")
                         ]
-                        starts.sort(key=lambda item: item["retry_index"])
-                        unit_runs = [item["run_id"] for item in starts]
+                        starts.sort(key=lambda attempt_entry: attempt_entry["retry_index"])
+                        unit_runs = [attempt_entry["run_id"] for attempt_entry in starts]
                         retry = 0
                         terminal = None
                         if starts:

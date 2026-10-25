@@ -1,8 +1,8 @@
 """Bounded transparent single-agent loop and serial frozen-genome task batches."""
 
-from collections.abc import Callable
+from collections.abc import Callable as Callable
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 from pydantic import Field, ValidationError, model_validator
 
@@ -31,14 +31,58 @@ from heas.core.domain import (
     uid,
 )
 from heas.core.errors import BudgetExceeded, HEASError, SecurityError
-from heas.core.ports import ModelClient, TaskEnvironment
+from heas.core.ports import (
+    FingerprintedEnvironment,
+    ModelClient,
+    StructuredTaskEvaluator,
+    TaskEnvironment,
+    TaskEvaluator,
+)
 from heas.experimentation.scheduler import SerialBatchScheduler
 from heas.infrastructure.adapters import AdapterRegistry
 from heas.infrastructure.model import CallBudget, ModelGateway
 from heas.infrastructure.storage import FileStore, digest, encode, redact
 
+_TerminationReason = Literal[
+    "final_answer",
+    "max_steps",
+    "budget_exceeded",
+    "tool_error",
+    "model_error",
+    "environment_error",
+    "cancelled",
+]
 
-class TaskAction(Record):
+_EventKind = Literal[
+    "run_start",
+    "capability_context",
+    "model_call_start",
+    "model_call_end",
+    "tool_call_start",
+    "tool_call_end",
+    "tool_call_error",
+    "feedback_received",
+    "run_end",
+    "security_event",
+]
+
+
+class _EventEmitter(Protocol):
+    """Accept only trace event kinds and capability references owned by the runtime."""
+
+    def __call__(
+        self,
+        kind: _EventKind,
+        step: int,
+        payload: dict[str, Any] | None = None,
+        *,
+        skill_refs: list[str] | None = None,
+        memory_refs: list[str] | None = None,
+        tool_ids: list[str] | None = None,
+    ) -> None: ...
+
+
+class TaskAction(Record, frozen=True):
     """Validate the JSON loop's mutually exclusive final response or approved tool request."""
 
     action: Literal["final", "tool"]
@@ -64,11 +108,21 @@ class _TaskExecution:
 
     answer: str
     result: TaskResult
-    reason: Any
+    reason: _TerminationReason
     errors: list[str]
     capabilities: list[dict[str, Any]]
     client: ModelClient
     environment: TaskEnvironment
+
+
+@dataclass
+class _DecodedTurn:
+    """Normalize transport actions without conflating requests with successful effects."""
+
+    calls: list[NativeToolCall]
+    result: TaskResult
+    reported_skill_ids: list[str]
+    payload: dict[str, Any]
 
 
 class TaskRunService:
@@ -97,7 +151,18 @@ class TaskRunService:
                 bind(self.gateway)
 
     def batch(self, plan: RunPlan, *, resume: bool = False) -> list[TaskRunRecord]:
-        """Run a serial plan against fixed genomes and optionally reuse committed units."""
+        """Execute serial independent tasks using each plan's frozen Genome versions.
+
+        Args:
+            plan: Host-approved tasks, ports, resource limits and Genome identities.
+            resume: Reuse committed units after checking the archived plan identity.
+
+        Returns:
+            Separate archived runs, including failed tasks and their measured usage.
+
+        Raises:
+            HEASError: Plan identity or an injected execution port is invalid.
+        """
         if plan.task_provider_id not in self.adapters.providers:
             raise HEASError("task provider not registered")
         if plan.environment_adapter_id not in self.adapters.environments:
@@ -167,7 +232,13 @@ class TaskRunService:
         trace_uri = f"runs/{run_id}/trace.jsonl"
 
         def emit(
-            kind: Any, step: int, payload: dict[str, Any] | None = None, **kwargs: Any
+            kind: _EventKind,
+            step: int,
+            payload: dict[str, Any] | None = None,
+            *,
+            skill_refs: list[str] | None = None,
+            memory_refs: list[str] | None = None,
+            tool_ids: list[str] | None = None,
         ) -> None:
             self.store.append_event(
                 TraceEvent(
@@ -176,7 +247,9 @@ class TaskRunService:
                     step=step,
                     event_type=kind,
                     safe_payload=redact(payload or {}),
-                    **kwargs,
+                    skill_refs=skill_refs or [],
+                    memory_refs=memory_refs or [],
+                    tool_ids=tool_ids or [],
                 )
             )
 
@@ -197,6 +270,12 @@ class TaskRunService:
         )
         public_feedback = None
         feedback_uri = None
+        environment_metadata: dict[str, str | None] = {}
+        if isinstance(environment, FingerprintedEnvironment):
+            fingerprint = environment.input_fingerprint
+            if fingerprint is not None and not isinstance(fingerprint, str):
+                raise HEASError("environment input fingerprint must be a string or None")
+            environment_metadata["environment_input_sha256"] = fingerprint
         run = TaskRunRecord(
             run_id=run_id,
             run_plan_id=plan.run_plan_id,
@@ -223,11 +302,7 @@ class TaskRunService:
                     "budget_scope_ids": self.gateway.scope_ids(meter),
                     "model_identity": task_client.identity,
                     "model_parameters_sha256": digest(encode(getattr(task_client, "settings", {}))),
-                    **(
-                        {"environment_input_sha256": environment.input_fingerprint}
-                        if hasattr(environment, "input_fingerprint")
-                        else {}
-                    ),
+                    **environment_metadata,
                 }
             },
         )
@@ -276,15 +351,18 @@ class TaskRunService:
         answer: str,
     ) -> EvaluationResult | None:
         """Separate evaluator execution faults from rejected evaluation contracts."""
-        if plan.task_evaluator_id is None:
+        evaluator_id = plan.task_evaluator_id
+        if evaluator_id is None:
             return None
-        adapter = self.adapters.evaluators[plan.task_evaluator_id]
+        adapter = self.adapters.evaluators[evaluator_id]
         try:
             workspace = self.store.path(f"runs/{run.run_id}")
-            if hasattr(adapter, "evaluate_result"):
+            if isinstance(adapter, StructuredTaskEvaluator):
                 raw_feedback = adapter.evaluate_result(task, run, task_result, workspace)
-            else:
+            elif isinstance(adapter, TaskEvaluator):
                 raw_feedback = adapter.evaluate(task, run, answer, workspace)
+            else:
+                raise HEASError("registered evaluator does not implement a task evaluation port")
         except ValidationError as exc:
             return self._reject_evaluation(run, plan, "evaluation_schema_error", type(exc).__name__)
         except Exception as exc:
@@ -294,9 +372,10 @@ class TaskRunService:
         try:
             # Revalidate model instances as data too: a Host adapter may construct
             # a receipt without validation, or copy it with unchecked updates.
-            if isinstance(raw_feedback, EvaluationResult):
-                raw_feedback = raw_feedback.model_dump()
-            feedback = EvaluationResult.model_validate(raw_feedback)
+            feedback_data: object = raw_feedback
+            if isinstance(feedback_data, EvaluationResult):
+                feedback_data = feedback_data.model_dump()
+            feedback = EvaluationResult.model_validate(feedback_data)
             if feedback.evaluator_version == "unversioned":
                 feedback = EvaluationResult.model_validate(
                     {
@@ -307,7 +386,7 @@ class TaskRunService:
         except ValidationError as exc:
             return self._reject_evaluation(run, plan, "evaluation_schema_error", type(exc).__name__)
         category = None
-        if feedback.evaluator_id != plan.task_evaluator_id:
+        if feedback.evaluator_id != evaluator_id:
             category = "evaluator_identity_mismatch"
         elif feedback.run_id != run.run_id:
             category = "run_identity_mismatch"
@@ -326,6 +405,9 @@ class TaskRunService:
     ) -> EvaluationResult:
         # Exception messages and rejected payloads can contain private grading data.
         # Persist only a fixed category and exception class, never a fabricated score.
+        evaluator_id = plan.task_evaluator_id
+        if evaluator_id is None:
+            raise HEASError("evaluation rejection requires a configured evaluator")
         diagnostic_ref = f"runs/{run.run_id}/evaluation_diagnostic.json"
         self.store.put(
             diagnostic_ref,
@@ -336,9 +418,8 @@ class TaskRunService:
                 "error_type": error_type,
             },
         )
-        assert plan.task_evaluator_id is not None
         return EvaluationResult(
-            evaluator_id=plan.task_evaluator_id,
+            evaluator_id=evaluator_id,
             run_id=run.run_id,
             evaluator_version=plan.evaluator_version or "unversioned",
             evaluation_status="failed" if category == "evaluator_execution_error" else "invalid",
@@ -355,11 +436,11 @@ class TaskRunService:
         attempt: int,
         run_id: str,
         meter: CallBudget,
-        emit: Callable[..., None],
+        emit: _EventEmitter,
     ) -> _TaskExecution:
         """Run the bounded loop and always revoke environment access before evaluation."""
         environment = self.adapters.environments[plan.environment_adapter_id]
-        reason: Any = "max_steps"
+        reason: _TerminationReason = "max_steps"
         answer = ""
         task_result = TaskResult()
         task_client = self.gateway.client_for("task")
@@ -412,51 +493,13 @@ class TaskRunService:
                     meter,
                     validator=(NativeModelTurn if native else TaskAction).model_validate,
                 )
-                adopted = []
-                if native:
-                    turn = NativeModelTurn.model_validate(response)
-                    calls = turn.tool_calls
-                    if len({c.call_id for c in calls}) != len(calls) or any(
-                        c.call_id in call_ids for c in calls
-                    ):
-                        raise HEASError("duplicate native tool call ID")
-                    call_ids.update(c.call_id for c in calls)
-                    assistant: dict[str, Any] = {"role": "assistant", "content": turn.content}
-                    if calls:
-                        assistant["tool_calls"] = [
-                            {
-                                "id": c.call_id,
-                                "type": "function",
-                                "function": {"name": c.tool_id, "arguments": c.raw_arguments},
-                            }
-                            for c in calls
-                        ]
-                    messages.append(assistant)
-                    final_result = turn.result or TaskResult(text=turn.content)
-                    action_payload = turn.model_dump(mode="json")
-                else:
-                    action = TaskAction.model_validate(response)
-                    adopted = action.adopted_skill_ids
-                    if not set(adopted).issubset({s.artifact_id for s in selected}):
-                        raise SecurityError("model claimed a skill outside injected context")
-                    calls = (
-                        [
-                            NativeToolCall(
-                                call_id=uid("tool_call"),
-                                tool_id=action.tool_id or "",
-                                arguments=action.arguments,
-                            )
-                        ]
-                        if action.action == "tool"
-                        else []
-                    )
-                    final_result = action.result or TaskResult(text=action.answer)
-                    action_payload = action.model_dump(mode="json")
+                turn = self._decode_turn(response, native, selected, messages, call_ids)
+                calls, final_result, adopted = turn.calls, turn.result, turn.reported_skill_ids
                 emit(
                     "model_call_end",
                     step,
                     {
-                        "action": action_payload,
+                        "action": turn.payload,
                         "model_reported_skill_ids": adopted,
                         "usage": meter.usage().model_dump(mode="json"),
                     },
@@ -532,6 +575,66 @@ class TaskRunService:
             answer, task_result, reason, errors, loaded_capabilities, task_client, environment
         )
 
+    @staticmethod
+    def _decode_turn(
+        response: dict[str, Any],
+        native: bool,
+        selected_skills: list[SkillRef],
+        messages: list[dict[str, Any]],
+        call_ids: set[str],
+    ) -> _DecodedTurn:
+        """Normalize model actions and retain native history before any tool runs.
+
+        The JSON protocol may report adoption only of injected Skills. Native
+        call IDs must be unique across this run so subsequent receipts correlate
+        with exactly one requested effect. Neither protocol establishes success.
+        """
+        if native:
+            turn = NativeModelTurn.model_validate(response)
+            calls = turn.tool_calls
+            if len({call.call_id for call in calls}) != len(calls) or any(
+                call.call_id in call_ids for call in calls
+            ):
+                raise HEASError("duplicate native tool call ID")
+            call_ids.update(call.call_id for call in calls)
+            assistant: dict[str, Any] = {"role": "assistant", "content": turn.content}
+            if calls:
+                assistant["tool_calls"] = [
+                    {
+                        "id": call.call_id,
+                        "type": "function",
+                        "function": {"name": call.tool_id, "arguments": call.raw_arguments},
+                    }
+                    for call in calls
+                ]
+            messages.append(assistant)
+            return _DecodedTurn(
+                calls,
+                turn.result or TaskResult(text=turn.content),
+                [],
+                turn.model_dump(mode="json"),
+            )
+        action = TaskAction.model_validate(response)
+        adopted = action.adopted_skill_ids
+        if not set(adopted).issubset({skill.artifact_id for skill in selected_skills}):
+            raise SecurityError("model claimed a skill outside injected context")
+        calls = []
+        if action.action == "tool":
+            tool_id = action.tool_id
+            if not tool_id:
+                raise HEASError("tool action requires tool_id")
+            calls.append(
+                NativeToolCall(
+                    call_id=uid("tool_call"), tool_id=tool_id, arguments=action.arguments
+                )
+            )
+        return _DecodedTurn(
+            calls,
+            action.result or TaskResult(text=action.answer),
+            adopted,
+            action.model_dump(mode="json"),
+        )
+
     def _prepare_turn(
         self,
         genome: TaskGenome,
@@ -542,7 +645,7 @@ class TaskRunService:
         results: list[dict[str, Any]],
         loaded_capabilities: list[dict[str, Any]],
         step: int,
-        emit: Callable[..., None],
+        emit: _EventEmitter,
     ) -> tuple[dict[str, Any], list[SkillRef], list[ToolBinding]]:
         """Select frozen capabilities, assemble public context, and record injection evidence."""
         skills, selected = self.skills.load(genome, task, observation.public_data, meter)
@@ -633,7 +736,8 @@ class TaskRunService:
         """Commit the public evidence package before binding its hash to the run record."""
         run_id, trace_uri = run.run_id, run.trace_ref
         answer, task_result = execution.answer, run.result
-        assert task_result is not None
+        if task_result is None:
+            raise HEASError("archiving a run requires its completed task result")
         reason, loaded_capabilities = execution.reason, execution.capabilities
         evaluation = run.evaluation
         plan_partition = run.task_partition

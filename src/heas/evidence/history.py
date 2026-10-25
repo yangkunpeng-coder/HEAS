@@ -10,7 +10,7 @@ from heas.infrastructure.model import CallBudget, ModelGateway
 from heas.infrastructure.storage import FileStore, encode
 
 
-class HistoryAnalysis(Record):
+class HistoryAnalysis(Record, frozen=True):
     """Validate bounded historical evidence reports used by upper-level decisions."""
 
     highlights: list[Claim]
